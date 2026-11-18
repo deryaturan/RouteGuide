@@ -1,350 +1,172 @@
+"""RouteGuide - AI-powered smart multi-stop itinerary & transit planner.
+
+Streamlit app (deployable on Streamlit Community Cloud via GitHub).
+External services: Google Places API (New), Google Routes API, Gemini API.
+Stateless: nothing is written to disk or a database (NFR-04).
 """
-RouteGuide (RG) - AI-Powered Smart Multi-Stop Itinerary & Transit Planner
-System Analysis and Design - Fall 2026-2027 - Derya Turan (2304109020)
+from __future__ import annotations
 
-Karşıladığı gereksinimler (rapor ile eşleşme):
-  FR-01 / OBJ-01 / BR-02 : Tarayıcı konumu, adres arama (Nominatim), kayıtlı yerler (fallback)
-  FR-02 / OBJ-02         : Gemini + Google Places (New) ile kategori bazlı öneri
-  FR-03 / OBJ-03 / BR-01 : En fazla 5 durak ekle / sil / yeniden sırala
-  FR-04                  : İkili (A->B, B->C) bacak bazlı çok duraklı transit hesabı
-  FR-05 / OBJ-04-05      : Transit vs Araç süresi + tahmini ücret yan yana (BR-03 uyarısı)
-  Rota optimizasyonu     : Distance Matrix + tüm permütasyonlar (<=5 durak => <=120 sıra)
-  Harita                 : Directions polyline'ları ile arayüz içinde harita
-  NFR-01                 : st.cache_data + harici API çağrı sayacı
-  NFR-02                 : Mobil öncelikli, tek sütun düzen
-  NFR-03                 : Hesaplama süresi ölçümü (hedef < 3 sn)
-  NFR-04                 : Veritabanı yok, yalnızca st.session_state (durumsuz oturum)
-  Hata/istisna akışları  : Bölüm 6.4
-
-Gerekli anahtarlar (Streamlit Cloud > Settings > Secrets):
-  GOOGLE_MAPS_API_KEY = "..."
-  GEMINI_API_KEY      = "..."
-  GEMINI_MODEL        = "gemini-2.5-flash"   # isteğe bağlı
-"""
-
+import html
 import itertools
 import json
-import math
 import os
+import re
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
+from datetime import time as dtime
+from urllib.parse import quote, urlencode
 
 import pandas as pd
 import pydeck as pdk
 import requests
 import streamlit as st
 
-try:  # FR-01: tarayıcı konumu (izin verilmezse uygulama çökmemeli - BR-02)
+try:  # browser geolocation component (permission prompt in the browser)
     from streamlit_geolocation import streamlit_geolocation
+except Exception:  # pragma: no cover
+    streamlit_geolocation = None
 
-    HAS_GEO = True
-except Exception:  # paket yoksa da manuel fallback çalışır
-    HAS_GEO = False
-
-# --------------------------------------------------------------------------
-# Sabitler
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
 MAX_STOPS = 5  # BR-01
-INF = 10**7
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "RouteGuide-SAD-Student-Project/1.0 (Izmir Democracy University)"
 
-CATEGORIES = {
-    "🍽️ Restoran": "restaurant",
-    "☕ Kafe": "cafe",
-    "🏛️ Müze": "museum",
-    "🌳 Park / Doğa": "park",
-    "🏺 Tarihi yer": "historical landmark",
-    "🛍️ Alışveriş": "shopping mall",
-    "🍰 Tatlı / Pastane": "dessert shop",
-    "🎭 Sanat / Kültür": "art gallery or cultural center",
-    "✍️ Diğer (kendim yazayım)": None,
-}
-
-PRESET_SPOTS = {  # R-03: hazır kayıtlı yerler
-    "Şehir Merkezi (Konak Saat Kulesi)": {"lat": 38.41885, "lng": 27.12872},
-    "Ege Üniversitesi Metro İstasyonu": {"lat": 38.45530, "lng": 27.22740},
-}
-
-PRICE_MAP = {
-    "PRICE_LEVEL_FREE": "Ücretsiz",
-    "PRICE_LEVEL_INEXPENSIVE": "₺",
-    "PRICE_LEVEL_MODERATE": "₺₺",
-    "PRICE_LEVEL_EXPENSIVE": "₺₺₺",
-    "PRICE_LEVEL_VERY_EXPENSIVE": "₺₺₺₺",
-}
-
-
-class ApiError(Exception):
-    """Harici API hatası (zaman aşımı, kota, yetki vb.)."""
-
-
-# --------------------------------------------------------------------------
-# Sayfa ayarı ve stil (NFR-02: 375px mobil uyumlu, yatay kaydırma yok)
-# --------------------------------------------------------------------------
 st.set_page_config(
     page_title="RouteGuide",
     page_icon="🧭",
-    layout="centered",
+    layout="wide",
     initial_sidebar_state="collapsed",
 )
-st.markdown(
-    """
-    <style>
-    .block-container {padding: 1.2rem 1rem 3rem 1rem; max-width: 760px;}
-    button {white-space: normal !important;}
-    html, body {overflow-x: hidden;}
-    [data-testid="stMetricValue"] {font-size: 1.5rem;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 
-# --------------------------------------------------------------------------
-# Oturum durumu (NFR-04: kalıcı depolama yok)
-# --------------------------------------------------------------------------
-def init_state():
-    defaults = {
-        "start": None,
-        "stops": [],
-        "saved": {"Ev": None, "Otel": None},
-        "result": None,
-        "discovered": None,
-        "flash": [],
-        "api_calls": 0,
-        "timings": [],
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-
-init_state()
-
-
-def flash(kind, msg):
-    st.session_state.flash.append((kind, msg))
-
-
-def show_flash():
-    for kind, msg in st.session_state.flash:
-        getattr(st, kind)(msg)
-    st.session_state.flash = []
-
-
-def invalidate():
-    st.session_state.result = None
-
-
-# --------------------------------------------------------------------------
-# Anahtarlar
-# --------------------------------------------------------------------------
-def secret(name, default=""):
+def secret(name: str, default: str = "") -> str:
     try:
-        val = st.secrets.get(name)
-        if val:
-            return str(val)
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
     except Exception:
         pass
     return os.environ.get(name, default)
 
 
-# --------------------------------------------------------------------------
-# Harici API yardımcıları
-# --------------------------------------------------------------------------
-def _request(method, url, **kwargs):
-    # Önbellek ıskalarında çalışır => gerçek harici çağrı sayısı (NFR-01 kanıtı)
-    st.session_state["api_calls"] = st.session_state.get("api_calls", 0) + 1
-    try:
-        return requests.request(method, url, timeout=20, **kwargs)
-    except requests.RequestException as exc:
-        raise ApiError(f"Ağ hatası veya zaman aşımı: {exc}")
+KEY_MAPS = secret("GOOGLE_MAPS_API_KEY")
+KEY_GEM = secret("GEMINI_API_KEY")
+
+PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
+ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+CUSTOM = "✍️ Custom search…"
+CATEGORIES = {  # label -> (Places text query, default visit minutes)
+    "🍽️ Restaurant": ("popular local restaurant", 60),
+    "☕ Cafe": ("popular cafe", 40),
+    "🥐 Breakfast": ("best breakfast place", 45),
+    "🍰 Dessert & bakery": ("popular dessert shop bakery", 30),
+    "🏛️ Museum": ("museum", 90),
+    "🏰 Historic site": ("historical landmark", 60),
+    "⭐ Top attraction": ("top tourist attraction", 60),
+    "🌳 Park & nature": ("park garden", 45),
+    "🌇 Viewpoint": ("scenic viewpoint", 30),
+    "🛍️ Shopping": ("shopping mall or bazaar", 60),
+    "🍸 Bar & nightlife": ("popular bar", 90),
+    "🏖️ Beach": ("beach", 90),
+    CUSTOM: ("", 45),
+}
+PRICE = {
+    "PRICE_LEVEL_FREE": "Free",
+    "PRICE_LEVEL_INEXPENSIVE": "$",
+    "PRICE_LEVEL_MODERATE": "$$",
+    "PRICE_LEVEL_EXPENSIVE": "$$$",
+    "PRICE_LEVEL_VERY_EXPENSIVE": "$$$$",
+}
+MODES = {"Public transit": "transit", "Driving": "driving", "Walking": "walking", "Cycling": "bicycling"}
+INTERESTS = [
+    "Local food", "History", "Art", "Nature", "Shopping", "Photography", "Nightlife",
+    "Family-friendly", "Hidden gems", "Vegetarian-friendly", "Budget-friendly", "Accessible",
+]
+DISCLAIMER = (
+    "Public transit fares are estimates returned by Google Maps and may differ from actual fares "
+    "depending on real-time municipal updates or ticket types."
+)
 
 
-def _maps_json(url, params):
-    r = _request("GET", url, params=params)
-    try:
-        data = r.json()
-    except ValueError:
-        raise ApiError(f"Geçersiz yanıt (HTTP {r.status_code}).")
-    status = data.get("status")
-    if status in ("OK", "ZERO_RESULTS", "NOT_FOUND"):
-        return data
-    raise ApiError(
-        f"Google Maps API hatası: {status} {data.get('error_message', '')}".strip()
+# --------------------------------------------------------------------------- #
+# Styling
+# --------------------------------------------------------------------------- #
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container{max-width:1100px;padding-top:1.6rem;padding-bottom:3rem}
+        .rg-hero h1{margin:0;font-size:2.3rem;letter-spacing:-.5px}
+        .rg-hero p{margin:.1rem 0 1rem;opacity:.75}
+        .rg-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
+                    gap:.75rem;margin:.5rem 0 1rem}
+        .rg-metric{border:1px solid rgba(128,128,128,.3);border-radius:14px;
+                   padding:.8rem 1rem;background:rgba(128,128,128,.08)}
+        .rg-metric .l{font-size:.8rem;opacity:.75}
+        .rg-metric .v{font-size:1.35rem;font-weight:700;line-height:1.3}
+        .rg-metric .s{font-size:.78rem;opacity:.7}
+        .rg-pick{border:1px solid rgba(26,115,232,.45);border-left:5px solid #1a73e8;
+                 border-radius:12px;padding:.7rem .9rem;margin:.4rem 0;
+                 background:rgba(26,115,232,.07)}
+        .rg-pick .meta{font-size:.85rem;opacity:.8}
+        .rg-pick .why{margin-top:.35rem;font-size:.9rem}
+        .rg-next{border-radius:14px;padding:1rem;background:rgba(52,168,83,.12);
+                 border:1px solid rgba(52,168,83,.5);margin:.5rem 0 1rem}
+        .rg-tl{border-left:3px solid rgba(26,115,232,.5);padding:.1rem 0 .1rem .8rem;margin:.1rem 0 .7rem}
+        .rg-tl .t{font-weight:700}
+        .rg-tl .tip{font-size:.9rem;opacity:.9;margin-top:.2rem}
+        @media (max-width:640px){
+            .block-container{padding:.8rem .7rem 3rem}
+            .rg-hero h1{font-size:1.8rem}
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def geocode(query, country_codes):
-    """Nominatim (OpenStreetMap) ile adres/yer arama."""
-    params = {
-        "q": query,
-        "format": "jsonv2",
-        "limit": 6,
-        "accept-language": "tr",
-    }
-    if country_codes:
-        params["countrycodes"] = country_codes
-    r = _request("GET", NOMINATIM_URL, params=params, headers={"User-Agent": USER_AGENT})
-    if r.status_code != 200:
-        raise ApiError(f"Nominatim hatası (HTTP {r.status_code}).")
-    out = []
-    for item in r.json():
-        disp = item.get("display_name", "")
-        out.append(
-            {
-                "name": item.get("name") or disp.split(",")[0],
-                "address": disp,
-                "lat": float(item["lat"]),
-                "lng": float(item["lon"]),
-                "place_id": f"osm-{item.get('place_id')}",
-            }
-        )
-    return out
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+def esc(x) -> str:
+    return html.escape(str(x if x is not None else ""))
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def places_search(lat, lng, text_query, radius, maps_key):
-    """Google Places API (New) - Text Search."""
-    url = "https://places.googleapis.com/v1/places:searchText"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": maps_key,
-        "X-Goog-FieldMask": (
-            "places.id,places.displayName,places.formattedAddress,places.location,"
-            "places.rating,places.userRatingCount,places.priceLevel,"
-            "places.primaryTypeDisplayName,places.googleMapsUri"
-        ),
-    }
-    body = {
-        "textQuery": text_query,
-        "languageCode": "tr",
-        "maxResultCount": 12,
-        "locationBias": {
-            "circle": {
-                "center": {"latitude": lat, "longitude": lng},
-                "radius": float(min(max(radius, 100), 50000)),
-            }
-        },
-    }
-    r = _request("POST", url, headers=headers, json=body)
-    if r.status_code != 200:
-        try:
-            msg = r.json().get("error", {}).get("message", "")
-        except ValueError:
-            msg = ""
-        raise ApiError(f"Places API hatası (HTTP {r.status_code}): {msg}")
-    places = []
-    for p in r.json().get("places", []):
-        loc = p.get("location", {})
-        places.append(
-            {
-                "name": p.get("displayName", {}).get("text", "?"),
-                "address": p.get("formattedAddress", ""),
-                "lat": loc.get("latitude"),
-                "lng": loc.get("longitude"),
-                "place_id": p.get("id"),
-                "rating": p.get("rating"),
-                "n_ratings": p.get("userRatingCount"),
-                "price": PRICE_MAP.get(p.get("priceLevel", ""), ""),
-                "type": p.get("primaryTypeDisplayName", {}).get("text", ""),
-                "uri": p.get("googleMapsUri", ""),
-            }
-        )
-    return [p for p in places if p["lat"] is not None]
+def fmt_dur(sec) -> str:
+    if sec is None:
+        return "Unavailable"
+    minutes = round(sec / 60)
+    h, m = divmod(minutes, 60)
+    return f"{h} h {m} min" if h else f"{m} min"
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def gemini_json(prompt, gem_key, model):
-    """Gemini'den yalnızca JSON döndürmesini ister ve ayrıştırır."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3},
-    }
-    r = _request("POST", url, params={"key": gem_key}, json=body)
-    if r.status_code != 200:
-        raise ApiError(f"Gemini API hatası (HTTP {r.status_code}).")
+def fmt_km(meters) -> str:
+    return f"{meters / 1000:.1f} km" if meters is not None else "-"
+
+
+def _err(resp: requests.Response) -> str:
     try:
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```")
-        return json.loads(text)
-    except (KeyError, IndexError, ValueError):
-        raise ApiError("Gemini yanıtı ayrıştırılamadı.")
+        return resp.json()["error"]["message"]
+    except Exception:
+        return f"HTTP {resp.status_code}"
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def distance_matrix(coords, mode, maps_key):
-    """Tüm noktalar arası süre matrisi (saniye). Erişilemeyenler INF."""
-    pts = "|".join(f"{a},{b}" for a, b in coords)
-    params = {"origins": pts, "destinations": pts, "mode": mode, "key": maps_key, "language": "tr"}
-    if mode == "transit":
-        params["departure_time"] = int(time.time())
-    data = _maps_json("https://maps.googleapis.com/maps/api/distancematrix/json", params)
-    matrix = []
-    for row in data.get("rows", []):
-        r = []
-        for el in row.get("elements", []):
-            r.append(el["duration"]["value"] if el.get("status") == "OK" else INF)
-        matrix.append(r)
-    n = len(coords)
-    if len(matrix) != n or any(len(r) != n for r in matrix):
-        raise ApiError("Mesafe matrisi beklenen boyutta dönmedi.")
-    return matrix
+def bayes_score(p: dict) -> float:
+    """Popularity score: rating pulled toward 4.2 when there are few reviews."""
+    r, n = p.get("rating") or 0.0, p.get("reviews") or 0
+    return (r * n + 4.2 * 50) / (n + 50) if n else 0.0
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def directions(olat, olng, dlat, dlng, mode, maps_key):
-    """Tek bacak (A->B) rota. Rota yoksa None."""
-    params = {
-        "origin": f"{olat},{olng}",
-        "destination": f"{dlat},{dlng}",
-        "mode": mode,
-        "language": "tr",
-        "region": "tr",
-        "key": maps_key,
-    }
-    if mode == "transit":
-        params["departure_time"] = int(time.time())
-    data = _maps_json("https://maps.googleapis.com/maps/api/directions/json", params)
-    return parse_route(data)
-
-
-def parse_route(data):
-    routes = data.get("routes") or []
-    if not routes:
-        return None
-    route = routes[0]
-    leg = route["legs"][0]
-    lines = []
-    n_transit = 0
-    for s in leg.get("steps", []):
-        if s.get("travel_mode") == "TRANSIT":
-            n_transit += 1
-            line = s.get("transit_details", {}).get("line", {})
-            veh = line.get("vehicle", {}).get("name", "")
-            name = line.get("short_name") or line.get("name") or "?"
-            lines.append(f"{veh} {name}".strip())
-    fare = route.get("fare")
-    return {
-        "seconds": leg["duration"]["value"],
-        "meters": leg["distance"]["value"],
-        "polyline": route.get("overview_polyline", {}).get("points", ""),
-        "lines": lines,
-        "n_transit": n_transit,
-        "api_fare": (float(fare["value"]), fare.get("currency", "TRY")) if fare else None,
-    }
-
-
-# --------------------------------------------------------------------------
-# Saf (API'siz) yardımcı fonksiyonlar - testlenebilir
-# --------------------------------------------------------------------------
-def decode_polyline(encoded):
+def decode_polyline(encoded: str) -> list[list[float]]:
     coords, index, lat, lng = [], 0, 0, 0
     while index < len(encoded):
-        for is_lat in (True, False):
-            shift, result = 0, 0
+        for is_lng in (False, True):
+            shift = result = 0
             while True:
                 b = ord(encoded[index]) - 63
                 index += 1
@@ -353,635 +175,858 @@ def decode_polyline(encoded):
                 if b < 0x20:
                     break
             delta = ~(result >> 1) if result & 1 else result >> 1
-            if is_lat:
-                lat += delta
-            else:
+            if is_lng:
                 lng += delta
-        coords.append((lat / 1e5, lng / 1e5))
+            else:
+                lat += delta
+        coords.append([lng / 1e5, lat / 1e5])
     return coords
 
 
-def best_order(matrix, n_stops, return_home=False):
-    """Başlangıç=0, duraklar=1..n. Toplam süreyi minimize eden sıra (<=120 permütasyon)."""
-    best, best_cost = list(range(1, n_stops + 1)), None
-    for perm in itertools.permutations(range(1, n_stops + 1)):
-        cost = matrix[0][perm[0]]
-        for a, b in zip(perm, perm[1:]):
-            cost += matrix[a][b]
-        if return_home:
-            cost += matrix[perm[-1]][0]
-        if best_cost is None or cost < best_cost:
-            best, best_cost = list(perm), cost
+def maps_url(dest: dict, origin: dict | None = None, waypoints: list[dict] | None = None,
+             mode: str = "transit") -> str:
+    """Google Maps URL. If origin is None Google Maps uses the user's live position."""
+    params = {
+        "api": 1,
+        "destination": f"{dest['lat']},{dest['lng']}",
+        "travelmode": mode,
+    }
+    if dest.get("place_id"):
+        params["destination_place_id"] = dest["place_id"]
+    if origin:
+        params["origin"] = f"{origin['lat']},{origin['lng']}"
+        if origin.get("place_id"):
+            params["origin_place_id"] = origin["place_id"]
+    if waypoints:
+        params["waypoints"] = "|".join(f"{w['lat']},{w['lng']}" for w in waypoints)
+        if all(w.get("place_id") for w in waypoints):
+            params["waypoint_place_ids"] = "|".join(w["place_id"] for w in waypoints)
+    return "https://www.google.com/maps/dir/?" + urlencode(params, safe=",|", quote_via=quote)
+
+
+# --------------------------------------------------------------------------- #
+# External APIs (plain functions, no Streamlit calls -> safe in threads)
+# --------------------------------------------------------------------------- #
+def places_search(query: str, lat=None, lng=None, radius=6000, n=10):
+    body: dict = {"textQuery": query, "maxResultCount": n, "languageCode": "en"}
+    if lat is not None:
+        body["locationBias"] = {
+            "circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(radius)}
+        }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": KEY_MAPS,
+        "X-Goog-FieldMask": (
+            "places.id,places.displayName,places.formattedAddress,places.location,"
+            "places.rating,places.userRatingCount,places.priceLevel,"
+            "places.primaryTypeDisplayName,places.editorialSummary,places.googleMapsUri"
+        ),
+    }
+    try:
+        r = requests.post(PLACES_URL, headers=headers, json=body, timeout=15)
+    except requests.RequestException as e:
+        return [], f"Network error: {e}"
+    if r.status_code != 200:
+        return [], f"Google Places: {_err(r)}"
+    out = []
+    for p in r.json().get("places", []):
+        loc = p.get("location") or {}
+        if "latitude" not in loc:
+            continue
+        out.append({
+            "id": p.get("id", ""),
+            "place_id": p.get("id", ""),
+            "name": (p.get("displayName") or {}).get("text", "Unnamed place"),
+            "label": (p.get("displayName") or {}).get("text", "Unnamed place"),
+            "address": p.get("formattedAddress", ""),
+            "lat": loc["latitude"],
+            "lng": loc["longitude"],
+            "rating": p.get("rating"),
+            "reviews": p.get("userRatingCount", 0),
+            "price": PRICE.get(p.get("priceLevel")),
+            "type": (p.get("primaryTypeDisplayName") or {}).get("text", ""),
+            "summary": (p.get("editorialSummary") or {}).get("text", ""),
+            "url": p.get("googleMapsUri", ""),
+        })
+    return out, None
+
+
+def gemini(prompt: str, system: str, as_json: bool = True, temperature: float = 0.4):
+    if not KEY_GEM:
+        return None, "Gemini API key is not configured."
+    model = secret("GEMINI_MODEL", "gemini-2.5-flash")
+    cfg: dict = {"temperature": temperature}
+    if as_json:
+        cfg["responseMimeType"] = "application/json"
+    body = {
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": cfg,
+    }
+    try:
+        r = requests.post(
+            GEMINI_URL.format(model=model),
+            headers={"x-goog-api-key": KEY_GEM, "Content-Type": "application/json"},
+            json=body,
+            timeout=45,
+        )
+    except requests.RequestException as e:
+        return None, f"Gemini network error: {e}"
+    if r.status_code != 200:
+        return None, f"Gemini: {_err(r)}"
+    try:
+        parts = r.json()["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    except (KeyError, IndexError):
+        return None, "Gemini returned an empty answer."
+    if not as_json:
+        return text.strip(), None
+    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+    try:
+        return json.loads(text), None
+    except ValueError:
+        return None, "Gemini returned an invalid answer."
+
+
+def _secs(d: str) -> int:
+    return int(float(str(d).rstrip("s")))
+
+
+def fetch_leg(key: str, o: dict, d: dict, mode: str) -> dict:
+    """One pairwise leg (A->B) for TRANSIT or DRIVE via Routes API."""
+    body = {
+        "origin": {"location": {"latLng": {"latitude": o["lat"], "longitude": o["lng"]}}},
+        "destination": {"location": {"latLng": {"latitude": d["lat"], "longitude": d["lng"]}}},
+        "travelMode": mode,
+        "languageCode": "en-US",
+        "units": "METRIC",
+    }
+    mask = "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline"
+    if mode == "TRANSIT":
+        mask += ",routes.travelAdvisory.transitFare,routes.legs.steps.transitDetails"
+    try:
+        r = requests.post(
+            ROUTES_URL,
+            headers={"Content-Type": "application/json", "X-Goog-Api-Key": key, "X-Goog-FieldMask": mask},
+            json=body,
+            timeout=20,
+        )
+    except requests.RequestException:
+        return {"ok": False, "error": "Network error - please retry", "transient": True}
+    if r.status_code != 200:
+        return {"ok": False, "error": f"Google Routes: {_err(r)}", "transient": True}
+    routes = r.json().get("routes")
+    if not routes:
+        return {"ok": False, "error": "No route found", "transient": False}
+    rt = routes[0]
+    fare = None
+    tf = (rt.get("travelAdvisory") or {}).get("transitFare")
+    if tf:  # never estimated by us: only what Google returns (R-02)
+        amount = float(tf.get("units", 0) or 0) + (tf.get("nanos", 0) or 0) / 1e9
+        fare = {"amount": amount, "currency": tf.get("currencyCode", "")}
+    lines: list[str] = []
+    for leg in rt.get("legs", []):
+        for step in leg.get("steps", []):
+            td = step.get("transitDetails")
+            if td:
+                tl = td.get("transitLine") or {}
+                nm = tl.get("nameShort") or tl.get("name")
+                if nm and nm not in lines:
+                    lines.append(nm)
+    return {
+        "ok": True,
+        "seconds": _secs(rt["duration"]),
+        "meters": rt.get("distanceMeters"),
+        "fare": fare,
+        "lines": lines,
+        "polyline": (rt.get("polyline") or {}).get("encodedPolyline"),
+        "transient": False,
+    }
+
+
+def fetch_matrix(key: str, pts: list[dict]):
+    """Transit duration matrix between all points (one call)."""
+    wp = [{"waypoint": {"location": {"latLng": {"latitude": p["lat"], "longitude": p["lng"]}}}} for p in pts]
+    try:
+        r = requests.post(
+            MATRIX_URL,
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": key,
+                "X-Goog-FieldMask": "originIndex,destinationIndex,duration,condition",
+            },
+            json={"origins": wp, "destinations": wp, "travelMode": "TRANSIT"},
+            timeout=25,
+        )
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    rows = r.json()
+    if not isinstance(rows, list):
+        return None
+    n = len(pts)
+    m = [[None] * n for _ in range(n)]
+    for e in rows:
+        if e.get("condition") == "ROUTE_EXISTS" and "duration" in e:
+            m[e["originIndex"]][e["destinationIndex"]] = _secs(e["duration"])
+    return m
+
+
+def best_order(m: list[list]):
+    """Own sequencing logic (not Gemini): start fixed, brute force <=5 stops."""
+    n, best = len(m), None
+    for perm in itertools.permutations(range(1, n)):
+        total, prev, ok = 0, 0, True
+        for j in perm:
+            t = m[prev][j]
+            if t is None:
+                ok = False
+                break
+            total += t
+            prev = j
+        if ok and (best is None or total < best[0]):
+            best = (total, perm)
     return best
 
 
-def baseline_fare(n_boardings, base, transfer_ratio):
-    """R-02: API ücret döndürmezse temel tarife modeli (tahmin)."""
-    if n_boardings <= 0:
-        return 0.0
-    return round(base + (n_boardings - 1) * base * transfer_ratio, 2)
+# --------------------------------------------------------------------------- #
+# Session state
+# --------------------------------------------------------------------------- #
+ss = st.session_state
 
 
-def can_add_stop(stops):
-    """BR-01: en fazla 5 durak."""
-    return len(stops) < MAX_STOPS
+def new_stop() -> dict:
+    sid = uuid.uuid4().hex[:6]
+    cat = next(iter(CATEGORIES))
+    ss[f"cat_{sid}"] = cat
+    ss[f"visit_{sid}"] = CATEGORIES[cat][1]
+    return {"id": sid, "category": cat, "custom": "", "pick": None, "alts": []}
 
 
-def fmt_dur(sec):
-    if sec is None:
-        return "—"
-    m = int(round(sec / 60))
-    h, m = divmod(m, 60)
-    return f"{h} sa {m:02d} dk" if h else f"{m} dk"
+def init_state() -> None:
+    ss.setdefault("start", None)
+    ss.setdefault("start_cands", [])
+    ss.setdefault("leg_cache", {})
+    ss.setdefault("matrix_cache", {})
+    ss.setdefault("rec_cache", {})
+    ss.setdefault("result", None)
+    ss.setdefault("guide", None)
+    ss.setdefault("qa", [])
+    ss.setdefault("flash", None)
+    if "stops" not in ss:
+        ss.stops = [new_stop()]
 
 
-def fmt_dist(meters):
-    return "—" if meters is None else f"{meters / 1000:.1f} km"
+def find_stop(sid: str):
+    return next((s for s in ss.stops if s["id"] == sid), None)
 
 
-def place_exists(place, stops):
-    for s in stops:
-        if s.get("place_id") and s.get("place_id") == place.get("place_id"):
-            return True
-        if abs(s["lat"] - place["lat"]) < 1e-5 and abs(s["lng"] - place["lng"]) < 1e-5:
-            return True
-    return False
+def add_stop() -> None:
+    if len(ss.stops) >= MAX_STOPS:  # BR-01: block the 6th stop
+        ss.flash = f"You can add at most {MAX_STOPS} stops. Remove one to add another."
+        return
+    ss.stops.append(new_stop())
 
 
-# --------------------------------------------------------------------------
-# Durum değiştiren callback'ler
-# --------------------------------------------------------------------------
-def set_start(place):
-    st.session_state.start = {
-        "name": place["name"],
-        "address": place.get("address", ""),
-        "lat": place["lat"],
-        "lng": place["lng"],
-        "place_id": place.get("place_id"),
+def remove_stop(i: int) -> None:
+    if len(ss.stops) > 1:
+        ss.stops.pop(i)
+
+
+def move_stop(i: int, d: int) -> None:
+    j = i + d
+    if 0 <= j < len(ss.stops):
+        ss.stops[i], ss.stops[j] = ss.stops[j], ss.stops[i]
+
+
+def on_category_change(sid: str) -> None:
+    s = find_stop(sid)
+    if s:
+        s["category"] = ss[f"cat_{sid}"]
+        s["pick"], s["alts"] = None, []
+        ss[f"visit_{sid}"] = CATEGORIES[s["category"]][1]
+
+
+def on_alt_change(sid: str) -> None:
+    s = find_stop(sid)
+    if s:
+        chosen = ss.get(f"alt_{sid}")
+        s["pick"] = next((p for p in s["alts"] if p["id"] == chosen), s["pick"])
+
+
+def prefs() -> dict:
+    return {
+        "interests": ss.get("pref_interests", []),
+        "budget": ss.get("pref_budget", "Any"),
+        "pace": ss.get("pref_pace", "Balanced"),
+        "notes": (ss.get("pref_notes", "") or "").strip(),
     }
-    invalidate()
-    flash("success", f"Başlangıç noktası ayarlandı: {place['name']}")
 
 
-def save_spot(label):
-    s = st.session_state.start
-    if not s:
-        flash("warning", "Önce bir başlangıç noktası seçmelisin.")
-        return
-    st.session_state.saved[label] = dict(s)
-    flash("success", f"'{label}' olarak kaydedildi (yalnızca bu oturumda).")
+def anchor_for(idx: int):
+    for j in range(idx - 1, -1, -1):
+        if ss.stops[j]["pick"]:
+            return ss.stops[j]["pick"]
+    return ss.start
 
 
-def add_stop(place):
-    stops = st.session_state.stops
-    if not can_add_stop(stops):  # BR-01
-        flash("error", f"BR-01: En fazla {MAX_STOPS} durak ekleyebilirsin. Önce bir durağı sil.")
-        return
-    if place_exists(place, stops):
-        flash("warning", f"'{place['name']}' zaten rotada.")
-        return
-    stops.append(
+# --------------------------------------------------------------------------- #
+# Recommendations (Places = candidates, Gemini = personalised ranking)
+# --------------------------------------------------------------------------- #
+def get_recommendations(idx: int):
+    s = ss.stops[idx]
+    anchor = anchor_for(idx)
+    if not anchor:
+        return "Set your starting point first."
+    query = s["custom"].strip() if s["category"] == CUSTOM else CATEGORIES[s["category"]][0]
+    if not query:
+        return "Type what you are looking for."
+    pf = prefs()
+    ck = json.dumps([query, round(anchor["lat"], 3), round(anchor["lng"], 3), pf], sort_keys=True)
+    ordered = ss.rec_cache.get(ck)
+    if ordered is None:
+        places, err = places_search(query, anchor["lat"], anchor["lng"], radius=6000, n=15)
+        if err:
+            return err
+        if not places:
+            return "No results found. Try another category or search a specific place."
+        places.sort(key=bayes_score, reverse=True)
+        top = places[:8]
+        reasons: dict[str, str] = {}
+        rank_ids: list[str] = []
+        payload = [
+            {"id": p["id"], "name": p["name"], "rating": p["rating"], "reviews": p["reviews"],
+             "price": p["price"], "type": p["type"], "about": p["summary"], "address": p["address"]}
+            for p in top
+        ]
+        data, gerr = gemini(
+            "Rank these candidate places for a traveller looking for: "
+            f"{s['category'] if s['category'] != CUSTOM else query}.\n"
+            f"They are near: {anchor['label']}.\n"
+            f"Traveller preferences: {json.dumps(pf)}\n"
+            "Prefer places that are genuinely popular (high rating AND many reviews) and fit the preferences.\n"
+            'Return JSON: {"ranking":[{"id":"<candidate id>","reason":"<max 22 words>"}]} '
+            "with the best 5 candidates first.\nCandidates: " + json.dumps(payload),
+            "You are RouteGuide, a concise local travel guide. Use only the candidate list; "
+            "never invent places, prices or opening hours.",
+        )
+        if data and isinstance(data.get("ranking"), list):
+            valid = {p["id"] for p in top}
+            for item in data["ranking"]:
+                if isinstance(item, dict) and item.get("id") in valid and item["id"] not in reasons:
+                    reasons[item["id"]] = str(item.get("reason", ""))[:200]
+                    rank_ids.append(item["id"])
+        elif gerr:
+            ss.flash = f"AI ranking unavailable ({gerr}). Showing the most popular places instead."
+        by_id = {p["id"]: p for p in top}
+        ordered = [by_id[i] for i in rank_ids] + [p for p in top if p["id"] not in rank_ids]
+        for p in ordered:
+            p["reason"] = reasons.get(p["id"]) or (
+                f"Highly rated ({p['rating']}) with {p['reviews']:,} reviews." if p.get("rating") else "Popular nearby."
+            )
+        ss.rec_cache[ck] = ordered
+    taken = {o["pick"]["id"] for k, o in enumerate(ss.stops) if k != idx and o["pick"]}
+    options = [p for p in ordered if p["id"] not in taken]
+    if not options:
+        return "All results are already used in other stops. Try another category."
+    s["alts"], s["pick"] = options, options[0]
+    ss[f"alt_{s['id']}"] = options[0]["id"]
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Legs, totals, timeline
+# --------------------------------------------------------------------------- #
+def leg_key(a: dict, b: dict, mode: str) -> str:
+    return f"{a['lat']:.5f},{a['lng']:.5f}>{b['lat']:.5f},{b['lng']:.5f}|{mode}"
+
+
+def ensure_legs(points: list[dict]) -> None:
+    """Session-state cache at origin-destination-mode level (NFR-01)."""
+    cache = ss.leg_cache
+    todo = []
+    for a, b in zip(points, points[1:]):
+        for m in ("TRANSIT", "DRIVE"):
+            k = leg_key(a, b, m)
+            if k not in cache or cache[k].get("transient"):
+                todo.append((k, a, b, m))
+    if todo:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(ex.map(lambda t: fetch_leg(KEY_MAPS, t[1], t[2], t[3]), todo))
+        for t, res in zip(todo, results):
+            cache[t[0]] = res
+
+
+def get_legs(points: list[dict]) -> list[dict]:
+    miss = {"ok": False, "error": "Not calculated", "transient": True}
+    return [
         {
-            "name": place["name"],
-            "address": place.get("address", ""),
-            "lat": place["lat"],
-            "lng": place["lng"],
-            "place_id": place.get("place_id"),
+            "from": a, "to": b,
+            "TRANSIT": ss.leg_cache.get(leg_key(a, b, "TRANSIT"), miss),
+            "DRIVE": ss.leg_cache.get(leg_key(a, b, "DRIVE"), miss),
         }
-    )
-    invalidate()
-    flash("success", f"Durak eklendi: {place['name']} ({len(stops)}/{MAX_STOPS})")
+        for a, b in zip(points, points[1:])
+    ]
 
 
-def remove_stop(i):
-    st.session_state.stops.pop(i)
-    invalidate()
+def mode_total(legs: list[dict], mode: str):
+    """Partial totals are never shown (report 6.4)."""
+    if legs and all(l[mode]["ok"] for l in legs):
+        return sum(l[mode]["seconds"] for l in legs), sum(l[mode].get("meters") or 0 for l in legs)
+    return None, None
 
 
-def move_stop(i, delta):
-    stops = st.session_state.stops
-    j = i + delta
-    if 0 <= j < len(stops):
-        stops[i], stops[j] = stops[j], stops[i]
-        invalidate()
+def fare_summary(legs: list[dict]):
+    got, missing = [], []
+    for i, l in enumerate(legs, 1):
+        t = l["TRANSIT"]
+        (got if t["ok"] and t.get("fare") else missing).append((i, t.get("fare")))
+    if not got:
+        return "Fare not available", "Google Maps returned no fare for this route"
+    by: dict[str, float] = {}
+    for _, f in got:
+        by[f["currency"]] = by.get(f["currency"], 0.0) + f["amount"]
+    text = " + ".join(f"{amt:,.2f} {cur}" for cur, amt in by.items())
+    if missing:
+        return text, "Incomplete: fare not available for leg(s) " + ", ".join(str(i) for i, _ in missing)
+    return text, "Estimate returned by Google Maps"
 
 
-def clear_all():
-    for k in ("start", "stops", "result", "discovered"):
-        st.session_state[k] = None if k in ("start", "result", "discovered") else []
-    st.session_state.saved = {"Ev": None, "Otel": None}
+def build_timeline(points, legs, mode, start_t, visits):
+    if any(not l[mode]["ok"] for l in legs):
+        return None
+    t = datetime.combine(date.today(), start_t)
+    rows = []
+    for i, l in enumerate(legs):
+        arrive = t + timedelta(seconds=l[mode]["seconds"])
+        leave = arrive + timedelta(minutes=visits[i])
+        rows.append({"i": i + 1, "travel": l[mode]["seconds"], "arrive": arrive, "leave": leave,
+                     "place": points[i + 1], "visit": visits[i]})
+        t = leave
+    return rows
 
 
-# --------------------------------------------------------------------------
-# FR-02: Gemini + Places ile kategori bazlı öneri
-# --------------------------------------------------------------------------
-def run_discovery(center, category_label, query_en, prefs, radius, maps_key, gem_key, model):
-    notes = []
-    text_query, min_rating = query_en, 0.0
-
-    # 1) Doğal dil tercihlerini arama sorgusuna çevir (Gemini)
-    if gem_key and prefs.strip():
-        try:
-            parsed = gemini_json(
-                "A traveler wants to find places in the category '"
-                + category_label
-                + "'. Their preferences (any language): '"
-                + prefs.strip()
-                + "'. Return ONLY JSON: {\"text_query\": \"a concise English Google Places "
-                "text search query that reflects the category and preferences\", "
-                "\"min_rating\": a number between 0 and 4.7}.",
-                gem_key,
-                model,
-            )
-            text_query = str(parsed.get("text_query") or query_en)
-            min_rating = float(parsed.get("min_rating") or 0)
-        except (ApiError, ValueError, TypeError) as exc:
-            notes.append(f"Tercihler Gemini ile işlenemedi, varsayılan arama kullanıldı ({exc}).")
-    elif prefs.strip() and not gem_key:
-        notes.append("Gemini anahtarı yok: tercih metni yorumlanmadı, standart arama yapıldı.")
-
-    # 2) Google Places araması
-    places = places_search(center["lat"], center["lng"], text_query, radius, maps_key)
-    if not places:
-        return [], notes, text_query
-    filtered = [p for p in places if (p["rating"] or 0) >= min_rating] or places
-
-    # 3) Gemini ile bağlama duyarlı sıralama + gerekçe
-    ranked = None
-    if gem_key:
-        try:
-            listing = [
-                {
-                    "index": i,
-                    "name": p["name"],
-                    "type": p["type"],
-                    "rating": p["rating"],
-                    "ratings_count": p["n_ratings"],
-                    "price": p["price"],
-                    "address": p["address"],
-                }
-                for i, p in enumerate(filtered)
-            ]
-            out = gemini_json(
-                "You are a local travel guide. Category: "
-                + category_label
-                + ". Traveler preferences: '"
-                + (prefs.strip() or "none")
-                + "'. Candidate venues (JSON): "
-                + json.dumps(listing, ensure_ascii=False)
-                + ". Pick the best up to 6 venues, ordered by relevance. Return ONLY JSON: "
-                '{"picks": [{"index": <int>, "reason": "<one short sentence in Turkish>"}]}.',
-                gem_key,
-                model,
-            )
-            ranked = []
-            for pick in out.get("picks", []):
-                idx = int(pick["index"])
-                if 0 <= idx < len(filtered):
-                    item = dict(filtered[idx])
-                    item["reason"] = str(pick.get("reason", ""))
-                    ranked.append(item)
-        except (ApiError, ValueError, TypeError, KeyError) as exc:
-            notes.append(f"Gemini sıralaması kullanılamadı, puana göre sıralandı ({exc}).")
-    if not ranked:
-        ranked = sorted(
-            filtered,
-            key=lambda p: (p["rating"] or 0) * math.log10((p["n_ratings"] or 0) + 10),
-            reverse=True,
-        )[:6]
-        ranked = [dict(p, reason="") for p in ranked]
-    return ranked, notes, text_query
+def route_sig(points: list[dict]) -> tuple:
+    return tuple((round(p["lat"], 5), round(p["lng"], 5)) for p in points)
 
 
-# --------------------------------------------------------------------------
-# FR-04 / FR-05: Çok duraklı hesap (ikili bacaklar) + optimizasyon
-# --------------------------------------------------------------------------
-def compute_trip(start, stops, optimize, criterion, return_home, maps_key, fare_cfg):
-    t0 = time.perf_counter()
-    order = list(stops)
-    optimized = False
-    if optimize and len(stops) > 1:
-        coords = tuple((p["lat"], p["lng"]) for p in [start] + stops)
-        matrix = distance_matrix(coords, criterion, maps_key)
-        perm = best_order(matrix, len(stops), return_home)
-        order = [stops[i - 1] for i in perm]
-        optimized = perm != list(range(1, len(stops) + 1))
-
-    seq = [start] + order + ([start] if return_home else [])
-    legs = []
-    for a, b in zip(seq, seq[1:]):
-        tr = directions(a["lat"], a["lng"], b["lat"], b["lng"], "transit", maps_key)
-        dr = directions(a["lat"], a["lng"], b["lat"], b["lng"], "driving", maps_key)
-        fare, fare_src, cur = None, "—", "TRY"
-        if tr is not None:
-            if tr["api_fare"]:
-                fare, cur = tr["api_fare"]
-                fare_src = "Google API"
-            else:
-                fare = baseline_fare(tr["n_transit"], fare_cfg["base"], fare_cfg["ratio"])
-                fare_src = "Temel tarife (tahmin)"
-        legs.append(
-            {
-                "from": a["name"],
-                "to": b["name"],
-                "transit": tr,
-                "driving": dr,
-                "fare": fare,
-                "fare_src": fare_src,
-                "currency": cur,
-            }
-        )
-
-    t_vals = [l["transit"]["seconds"] for l in legs if l["transit"]]
-    d_vals = [l["driving"]["seconds"] for l in legs if l["driving"]]
-    fares = [l["fare"] for l in legs if l["fare"] is not None]
-    result = {
-        "start": start,
-        "order": order,
-        "legs": legs,
-        "optimized": optimized,
-        "t_transit": sum(t_vals) if t_vals else None,
-        "t_driving": sum(d_vals) if d_vals else None,
-        "missing_transit": sum(1 for l in legs if l["transit"] is None),
-        "missing_driving": sum(1 for l in legs if l["driving"] is None),
-        "fare_total": sum(fares) if fares else 0.0,
-        "currency": legs[0]["currency"] if legs else "TRY",
-        "elapsed": time.perf_counter() - t0,
-        "return_home": return_home,
-    }
-    return result
-
-
-# --------------------------------------------------------------------------
-# Harita (Directions polyline'ları ile arayüz içinde)
-# --------------------------------------------------------------------------
-def build_map(res, mode_key):
-    paths = []
-    color = [30, 100, 220] if mode_key == "transit" else [230, 120, 20]
-    for leg in res["legs"]:
-        route = leg[mode_key]
-        if route and route["polyline"]:
-            pts = decode_polyline(route["polyline"])
-            paths.append({"path": [[lng, lat] for lat, lng in pts], "color": color})
-    marks = [{"label": "A: " + res["start"]["name"], "lat": res["start"]["lat"], "lng": res["start"]["lng"]}]
-    for i, s in enumerate(res["order"], start=1):
-        marks.append({"label": f"{i}: {s['name']}", "lat": s["lat"], "lng": s["lng"]})
-    df = pd.DataFrame(marks)
-
-    all_lat = [m["lat"] for m in marks] + [p[1] for d in paths for p in d["path"]]
-    all_lng = [m["lng"] for m in marks] + [p[0] for d in paths for p in d["path"]]
-    clat, clng = (min(all_lat) + max(all_lat)) / 2, (min(all_lng) + max(all_lng)) / 2
-    span = max(
-        max(all_lat) - min(all_lat),
-        (max(all_lng) - min(all_lng)) * math.cos(math.radians(clat)),
-        0.005,
-    )
-    zoom = max(9, min(15, math.log2(360 / span) - 1))
-
-    layers = []
-    if paths:
-        layers.append(
-            pdk.Layer("PathLayer", data=paths, get_path="path", get_color="color", width_min_pixels=4)
-        )
-    layers.append(
-        pdk.Layer(
-            "ScatterplotLayer",
-            data=df,
-            get_position="[lng, lat]",
-            get_fill_color=[200, 30, 30, 220],
-            get_radius=60,
-            radius_min_pixels=7,
-            pickable=True,
-        )
-    )
-    layers.append(
-        pdk.Layer(
-            "TextLayer",
-            data=df,
-            get_position="[lng, lat]",
-            get_text="label",
-            get_size=14,
-            get_color=[20, 20, 20, 255],
-            get_pixel_offset=[0, -20],
-        )
-    )
-    return pdk.Deck(
-        layers=layers,
-        initial_view_state=pdk.ViewState(latitude=clat, longitude=clng, zoom=zoom),
-        tooltip={"text": "{label}"},
+# --------------------------------------------------------------------------- #
+# UI pieces
+# --------------------------------------------------------------------------- #
+def place_card(p: dict) -> None:
+    stars = f"⭐ {p['rating']:.1f} ({p['reviews']:,} reviews)" if p.get("rating") else "No rating yet"
+    meta = " · ".join(x for x in [p.get("type"), p.get("price"), stars] if x)
+    why = f"<div class='why'>✨ {esc(p['reason'])}</div>" if p.get("reason") else ""
+    link = f" · <a href='{esc(p['url'])}' target='_blank'>View on Google Maps</a>" if p.get("url") else ""
+    st.markdown(
+        f"<div class='rg-pick'><b>{esc(p['name'])}</b><br><span class='meta'>{esc(meta)}</span><br>"
+        f"<span class='meta'>{esc(p['address'])}{link}</span>{why}</div>",
+        unsafe_allow_html=True,
     )
 
 
-# --------------------------------------------------------------------------
-# Doğrulama testleri (traceability: TC-01..TC-05 için çevrimdışı kontroller)
-# --------------------------------------------------------------------------
-def run_self_tests():
-    results = []
-
-    def check(name, cond):
-        results.append((name, bool(cond)))
-
-    pts = decode_polyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@")
-    check("Polyline çözme", abs(pts[0][0] - 38.5) < 1e-4 and abs(pts[2][1] + 126.453) < 1e-3)
-    check("BR-01: 5 durakta 6.'yı engelle", can_add_stop([0] * 4) and not can_add_stop([0] * 5))
-    m = [[0, 10, 50, 20], [10, 0, 5, 40], [50, 5, 0, 8], [20, 40, 8, 0]]
-    check("Optimizasyon (0->1->2->3 en kısa)", best_order(m, 3) == [1, 2, 3])
-    m2 = [[0, 90, 5], [90, 0, 5], [5, 5, 0]]
-    check("Optimizasyon (en yakın durak önce)", best_order(m2, 2)[0] == 2)
-    check("Temel tarife: 0 biniş = 0", baseline_fare(0, 30, 0.5) == 0.0)
-    check("Temel tarife: 2 biniş", baseline_fare(2, 30, 0.5) == 45.0)
-    check("Süre biçimi", fmt_dur(3900) == "1 sa 05 dk" and fmt_dur(None) == "—")
-    check(
-        "Yinelenen durak engeli",
-        place_exists({"lat": 1.0, "lng": 1.0, "place_id": "x"}, [{"lat": 1.0, "lng": 1.0, "place_id": "y"}]),
-    )
-    return results
+def render_personalization() -> None:
+    with st.expander("🎛️ Personalize your day", expanded=False):
+        c1, c2 = st.columns(2)
+        c1.multiselect("Interests", INTERESTS, key="pref_interests")
+        c2.selectbox("Budget", ["Any", "Budget ($)", "Mid-range ($$)", "Premium ($$$)"], key="pref_budget")
+        c1.selectbox("Pace", ["Relaxed", "Balanced", "Packed"], index=1, key="pref_pace")
+        c2.text_area("Anything else? (diet, kids, mobility, mood…)", key="pref_notes", height=68,
+                     placeholder="e.g. vegetarian, travelling with a toddler, love sea views")
 
 
-# --------------------------------------------------------------------------
-# Kenar çubuğu
-# --------------------------------------------------------------------------
-with st.sidebar:
-    st.header("⚙️ Ayarlar")
-    maps_key = st.text_input(
-        "Google Maps API anahtarı",
-        value=secret("GOOGLE_MAPS_API_KEY"),
-        type="password",
-        help="Streamlit Cloud > Secrets içine GOOGLE_MAPS_API_KEY olarak da ekleyebilirsin.",
-    )
-    gem_key = st.text_input(
-        "Gemini API anahtarı", value=secret("GEMINI_API_KEY"), type="password"
-    )
-    gem_model = st.text_input("Gemini modeli", value=secret("GEMINI_MODEL", "gemini-2.5-flash"))
-    country = st.text_input("Adres arama ülke kodu", value="tr", help="Nominatim countrycodes (boş = tüm dünya)")
-    st.divider()
-    criterion = st.radio(
-        "Optimizasyon kriteri",
-        ["transit", "driving"],
-        format_func=lambda x: "Toplu taşıma süresi" if x == "transit" else "Araç süresi",
-    )
-    st.subheader("Tarife varsayımı (R-02)")
-    fare_base = st.number_input("Temel biniş ücreti (TL)", 0.0, 500.0, 30.0, 0.5,
-                                help="API ücret döndürmezse kullanılan TAHMİNİ tarife. Kendi şehrinin güncel tarifesine göre güncelle.")
-    fare_ratio = st.slider("Aktarma ücreti oranı", 0.0, 1.0, 0.5, 0.05)
-    st.divider()
-    st.metric("Harici API çağrısı (bu oturum)", st.session_state.api_calls)
-    st.caption("Önbellek isabetlerinde sayaç artmaz (NFR-01).")
-    if st.session_state.timings:
-        st.caption("Hesaplama süreleri (sn): " + ", ".join(f"{t:.2f}" for t in st.session_state.timings[-6:]))
-    with st.expander("🧪 Doğrulama testleri"):
-        if st.button("Testleri çalıştır"):
-            for name, ok in run_self_tests():
-                st.write(("✅ " if ok else "❌ ") + name)
-    st.button("🗑️ Oturumu sıfırla", on_click=clear_all)
-
-# --------------------------------------------------------------------------
-# Başlık
-# --------------------------------------------------------------------------
-st.title("🧭 RouteGuide")
-st.caption("Yapay zekâ destekli çok duraklı gezi ve toplu taşıma planlayıcı")
-show_flash()
-
-if not maps_key:
-    st.warning("Google Maps API anahtarı bulunamadı. Kenar çubuğundan (☰) gir veya Secrets'a ekle.")
-
-c1, c2, c3 = st.columns(3)
-c1.markdown("**📍 Başlangıç**  \n" + (st.session_state.start["name"] if st.session_state.start else "_seçilmedi_"))
-c2.markdown(f"**🛑 Duraklar**  \n{len(st.session_state.stops)}/{MAX_STOPS}")
-c3.markdown("**📊 Sonuç**  \n" + ("hazır" if st.session_state.result else "_yok_"))
-
-tab_loc, tab_disc, tab_route, tab_res = st.tabs(["1 · Konum", "2 · Keşfet", "3 · Rota", "4 · Sonuç"])
-
-# ---------------------------- 1) Konum (FR-01) ----------------------------
-with tab_loc:
-    st.subheader("Başlangıç noktası")
-    sub_gps, sub_search, sub_saved = st.tabs(["📍 Konumum", "🔎 Adres ara", "⭐ Kayıtlı yerler"])
-
-    with sub_gps:
-        if HAS_GEO:
-            st.caption("Aşağıdaki düğmeye basıp tarayıcı izin penceresinde 'İzin ver' de.")
-            loc = streamlit_geolocation()
-            if loc and loc.get("latitude") is not None and loc.get("longitude") is not None:
-                st.success(f"Konum alındı: {loc['latitude']:.5f}, {loc['longitude']:.5f}")
-                st.button(
-                    "Bu konumu başlangıç yap",
-                    on_click=set_start,
-                    args=({"name": "Mevcut konumum", "lat": loc["latitude"], "lng": loc["longitude"],
-                           "place_id": "gps"},),
-                )
-            else:
-                st.info("Konum henüz alınmadı veya izin verilmedi. Sorun değil: 'Adres ara' veya "
-                        "'Kayıtlı yerler' sekmesini kullanabilirsin (BR-02).")
+def render_start() -> None:
+    st.subheader("1 · Where do you start?")
+    t_gps, t_manual = st.tabs(["📍 Use my location", "⌨️ Type an address or city"])
+    with t_gps:
+        st.caption("Tap the button and allow location access in your browser.")
+        loc = streamlit_geolocation() if streamlit_geolocation else None
+        lat, lng = (loc or {}).get("latitude"), (loc or {}).get("longitude")
+        if lat is not None and lng is not None:
+            if ss.get("gps_applied") != (lat, lng):
+                ss.start = {"label": "My current location", "lat": lat, "lng": lng, "place_id": None}
+                ss.gps_applied = (lat, lng)
+                ss.result = None
+            st.success("Location detected.")
         else:
-            st.info("Tarayıcı konum bileşeni yüklenemedi; 'Adres ara' veya 'Kayıtlı yerler' ile devam et.")
-
-    with sub_search:
-        q = st.text_input("Adres veya yer ara", key="start_q", placeholder="Örn. Ege Üniversitesi Metro İstasyonu")
-        if st.button("Ara", key="start_btn"):
+            st.info("Waiting for location permission. If it is blocked or unavailable, "
+                    "use the next tab - you can always type your start point.")
+    with t_manual:
+        with st.form("start_form", clear_on_submit=False):
+            q = st.text_input("Address, place or city", placeholder="e.g. Konak Square, İzmir")
+            go = st.form_submit_button("Set start point")
+        if go:
             if not q.strip():
-                st.warning("Lütfen aranacak bir yer yaz.")
+                st.warning("Please type an address or city.")
             else:
-                try:
-                    st.session_state["start_res"] = geocode(q.strip(), country.strip())
-                except ApiError as exc:
-                    st.error(f"Arama başarısız: {exc} Birkaç saniye sonra tekrar dene.")
-                    st.session_state["start_res"] = None
-        res = st.session_state.get("start_res")
-        if res is not None and len(res) == 0:
-            st.info("Sonuç bulunamadı. Farklı yazımla dene.")
-        if res:
-            i = st.selectbox("Sonuç", range(len(res)), format_func=lambda k: res[k]["address"][:90], key="start_sel")
-            st.button("Başlangıç yap", key="start_set", on_click=set_start, args=(res[i],))
-
-    with sub_saved:
-        for name, spot in PRESET_SPOTS.items():
-            st.button(f"📌 {name}", key=f"preset_{name}", on_click=set_start,
-                      args=({"name": name, "lat": spot["lat"], "lng": spot["lng"], "place_id": f"preset-{name}"},))
-        st.markdown("**Kendi yerlerin** (yalnızca bu oturumda tutulur)")
-        for label, spot in st.session_state.saved.items():
-            cc1, cc2 = st.columns(2)
-            if spot:
-                cc1.button(f"🏠 {label}: {spot['name'][:25]}", key=f"use_{label}", on_click=set_start, args=(spot,))
-            else:
-                cc1.caption(f"{label}: kayıtlı değil")
-            cc2.button(f"Başlangıcı '{label}' olarak kaydet", key=f"save_{label}", on_click=save_spot, args=(label,))
-
-    if st.session_state.start:
-        s = st.session_state.start
-        st.success(f"**Seçili başlangıç:** {s['name']} ({s['lat']:.4f}, {s['lng']:.4f})")
-
-# ---------------------------- 2) Keşfet (FR-02) ----------------------------
-with tab_disc:
-    st.subheader("Kategoriye göre mekan önerileri")
-    cat = st.selectbox("Kategori", list(CATEGORIES.keys()))
-    custom = ""
-    if CATEGORIES[cat] is None:
-        custom = st.text_input("Kategori / aranan şey", placeholder="Örn. deniz ürünleri, kitapçı, bisiklet kiralama")
-    prefs = st.text_area(
-        "Tercihlerin (isteğe bağlı)",
-        placeholder="Örn. ucuz ve sakin, vegan seçenekli, deniz manzaralı",
-        height=80,
-    )
-    radius = st.slider("Arama yarıçapı (m)", 500, 15000, 3000, 250)
-
-    if st.button("✨ Önerileri getir", type="primary"):
-        if not st.session_state.start:
-            st.warning("Önce 1 · Konum sekmesinden bir başlangıç noktası seç.")
-        elif not maps_key:
-            st.error("Google Maps API anahtarı gerekli.")
-        elif CATEGORIES[cat] is None and not custom.strip():
-            st.warning("Lütfen aranacak kategoriyi yaz.")
-        else:
-            query_en = CATEGORIES[cat] or custom.strip()
-            label = cat if CATEGORIES[cat] else custom.strip()
-            with st.spinner("Mekanlar aranıyor ve yapay zekâ ile sıralanıyor..."):
-                try:
-                    items, notes, used_q = run_discovery(
-                        st.session_state.start, label, query_en, prefs, radius,
-                        maps_key, gem_key, gem_model,
-                    )
-                    st.session_state.discovered = {"items": items, "notes": notes, "label": label, "query": used_q}
-                except ApiError as exc:
-                    st.session_state.discovered = None
-                    st.error(f"Öneriler alınamadı: {exc} Anahtar/kota durumunu kontrol edip tekrar dene.")
-
-    disc = st.session_state.discovered
-    if disc:
-        for n in disc["notes"]:
-            st.info(n)
-        if not disc["items"]:
-            st.info("Sonuç bulunamadı. Kategoriyi veya yarıçapı değiştirmeyi ya da 3 · Rota sekmesinden manuel arama yapmayı dene.")
-        for i, p in enumerate(disc["items"]):
-            with st.container(border=True):
-                st.markdown(f"**{p['name']}**  \n{p['type']}")
-                meta = []
-                if p["rating"]:
-                    meta.append(f"⭐ {p['rating']} ({p['n_ratings'] or 0})")
-                if p["price"]:
-                    meta.append(p["price"])
-                if meta:
-                    st.caption(" · ".join(meta))
-                st.caption(p["address"])
-                if p.get("reason"):
-                    st.markdown(f"🤖 _{p['reason']}_")
-                if p.get("uri"):
-                    st.markdown(f"[Google Maps'te aç]({p['uri']})")
-                already = place_exists(p, st.session_state.stops)
-                st.button("✓ Rotada" if already else "➕ Durağa ekle", key=f"add_disc_{i}",
-                          disabled=already, on_click=add_stop, args=(p,))
-
-# ---------------------------- 3) Rota (FR-03/04) ----------------------------
-with tab_route:
-    st.subheader(f"Gezi planı ({len(st.session_state.stops)}/{MAX_STOPS} durak)")
-
-    if not st.session_state.stops:
-        st.info("Henüz durak yok. 2 · Keşfet sekmesinden öneri ekle veya aşağıdan manuel ara.")
-    for i, s in enumerate(st.session_state.stops):
-        with st.container(border=True):
-            st.markdown(f"**{i + 1}. {s['name']}**")
-            st.caption(s.get("address", "")[:100])
-            b1, b2, b3 = st.columns(3)
-            b1.button("⬆️", key=f"up_{i}", on_click=move_stop, args=(i, -1), disabled=i == 0)
-            b2.button("⬇️", key=f"down_{i}", on_click=move_stop, args=(i, 1),
-                      disabled=i == len(st.session_state.stops) - 1)
-            b3.button("🗑️", key=f"del_{i}", on_click=remove_stop, args=(i,))
-
-    with st.expander("🔎 Manuel durak ara"):
-        sq = st.text_input("Yer adı / adres", key="stop_q")
-        if st.button("Ara", key="stop_btn"):
-            if not sq.strip():
-                st.warning("Lütfen aranacak bir yer yaz.")
-            else:
-                try:
-                    st.session_state["stop_res"] = geocode(sq.strip(), country.strip())
-                except ApiError as exc:
-                    st.error(f"Arama başarısız: {exc}")
-                    st.session_state["stop_res"] = None
-        sres = st.session_state.get("stop_res")
-        if sres is not None and len(sres) == 0:
-            st.info("Sonuç bulunamadı.")
-        if sres:
-            k = st.selectbox("Sonuç", range(len(sres)), format_func=lambda j: sres[j]["address"][:90], key="stop_sel")
-            st.button("➕ Durağa ekle", key="stop_add", on_click=add_stop, args=(sres[k],))
-
-    st.divider()
-    optimize = st.checkbox("🤖 Durak sırasını otomatik optimize et", value=True,
-                           help="Seçilen kritere göre toplam süreyi en aza indiren sırayı bulur.")
-    return_home = st.checkbox("Başlangıç noktasına geri dön", value=False)
-
-    if st.button("🚀 Rotayı hesapla", type="primary"):
-        if not st.session_state.start:
-            st.warning("Hesaplama için başlangıç noktası eksik (1 · Konum).")
-        elif not st.session_state.stops:
-            st.warning("Hesaplama için en az bir durak seçmelisin.")
-        elif not maps_key:
-            st.error("Google Maps API anahtarı gerekli.")
-        else:
-            try:
-                with st.spinner("Bacaklar hesaplanıyor..."):
-                    res = compute_trip(
-                        st.session_state.start, st.session_state.stops, optimize, criterion,
-                        return_home, maps_key, {"base": fare_base, "ratio": fare_ratio},
-                    )
-                st.session_state.result = res
-                st.session_state.timings.append(res["elapsed"])
-                if res["optimized"]:
-                    st.session_state.stops = list(res["order"])
-                st.success("Rota hazır! 4 · Sonuç sekmesine geç.")
-            except ApiError as exc:
-                # 6.4: kota/zaman aşımı -> kısmi toplam sunma, yeniden dene mesajı
-                st.session_state.result = None
-                st.error(f"Rota hesaplanamadı: {exc} Kısmi toplam gösterilmedi; lütfen tekrar dene.")
-
-# ---------------------------- 4) Sonuç (FR-05) ----------------------------
-with tab_res:
-    res = st.session_state.result
-    if not res:
-        st.info("Henüz sonuç yok. 3 · Rota sekmesinde 'Rotayı hesapla'ya bas.")
-    else:
-        st.subheader("Rota özeti")
-        if res["optimized"]:
-            st.success("Durak sırası toplam süreyi azaltacak şekilde yeniden düzenlendi: "
-                       + " → ".join([res["start"]["name"]] + [s["name"] for s in res["order"]]))
-
-        m1, m2, m3 = st.columns(3)
-        prefix = "≥ " if res["missing_transit"] else ""
-        m1.metric("🚌 Toplu taşıma", prefix + fmt_dur(res["t_transit"]))
-        m2.metric("🚗 Özel araç", ("≥ " if res["missing_driving"] else "") + fmt_dur(res["t_driving"]))
-        m3.metric("💳 Tahmini ücret", f"{res['fare_total']:.2f} {res['currency']}")
-
-        if res["t_transit"] and res["t_driving"]:
-            diff = res["t_transit"] - res["t_driving"]
-            st.caption(("Toplu taşıma, araca göre " + fmt_dur(abs(diff)) + (" daha uzun." if diff > 0 else " daha kısa.")))
-
-        if res["missing_transit"]:
-            st.warning(f"{res['missing_transit']} bacak için toplu taşıma rotası bulunamadı; o bacaklarda araç süresi "
-                       "gösteriliyor ve toplu taşıma toplamı eksiktir. İlgili durağı değiştirebilir veya silebilirsin.")
-        # BR-03
-        st.info("ℹ️ Gösterilen ücretler **tahmindir**; gerçek ücretler belediye güncellemelerine ve bilet türüne "
-                "göre değişebilir. Operatörler arası dinamik aktarma indirimleri hesaplanamamaktadır.")
-
-        rows = []
-        for i, leg in enumerate(res["legs"], start=1):
-            tr, dr = leg["transit"], leg["driving"]
-            rows.append(
-                {
-                    "Bacak": f"{i}. {leg['from']} → {leg['to']}",
-                    "Toplu taşıma": fmt_dur(tr["seconds"]) if tr else "Rota yok ⚠️",
-                    "Araç": fmt_dur(dr["seconds"]) if dr else "Rota yok ⚠️",
-                    "Mesafe": fmt_dist((dr or tr or {}).get("meters")),
-                    "Ücret (tahmin)": f"{leg['fare']:.2f} {leg['currency']}" if leg["fare"] is not None else "—",
-                    "Ücret kaynağı": leg["fare_src"],
-                    "Hatlar": ", ".join(tr["lines"]) if tr and tr["lines"] else ("Yürüyüş" if tr else "—"),
-                }
+                with st.spinner("Searching…"):
+                    res, err = places_search(q.strip(), n=5)
+                if err:
+                    st.error(err)
+                elif not res:
+                    st.warning("No match found. Try a more specific address.")
+                else:
+                    ss.start_cands = res
+                    ss.start = res[0]
+                    ss.result = None
+                    ss["start_pick"] = res[0]["id"]
+        if len(ss.start_cands) > 1:
+            def _pick_start():
+                m = next((c for c in ss.start_cands if c["id"] == ss.start_pick), None)
+                if m:
+                    ss.start, ss.result = m, None
+            st.selectbox(
+                "Not the right place?", [c["id"] for c in ss.start_cands], key="start_pick",
+                format_func=lambda i: next(f"{c['name']} - {c['address']}" for c in ss.start_cands if c["id"] == i),
+                on_change=_pick_start,
             )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    if ss.start:
+        st.success(f"📍 Start: **{ss.start['label']}**")
 
-        st.subheader("Harita")
-        mode_key = st.radio("Gösterilen rota", ["transit", "driving"], horizontal=True,
-                            format_func=lambda x: "🚌 Toplu taşıma" if x == "transit" else "🚗 Araç")
-        st.pydeck_chart(build_map(res, mode_key), use_container_width=True)
 
-        ok = res["elapsed"] < 3
-        st.caption(f"⏱️ Hesaplama süresi: {res['elapsed']:.2f} sn "
-                   + ("(✅ hedef < 3 sn)" if ok else "(⚠️ hedef 3 sn aşıldı; ilk çağrılar önbelleksizdir, tekrar hesaplayınca düşer)"))
+def render_stop(i: int, s: dict) -> None:
+    sid = s["id"]
+    with st.container(border=True):
+        st.markdown(f"**Stop {i + 1}**")
+        st.selectbox("What are you in the mood for?", list(CATEGORIES), key=f"cat_{sid}",
+                     on_change=on_category_change, args=(sid,))
+        if s["category"] == CUSTOM:
+            s["custom"] = st.text_input("Search for…", value=s["custom"], key=f"custom_{sid}",
+                                        placeholder="e.g. vegan brunch, vinyl shop, rooftop")
+        err = None
+        if st.button("✨ Get AI pick", key=f"rec_{sid}", width="stretch"):
+            with st.spinner("Asking the guide…"):
+                err = get_recommendations(i)
+            ss.result = None if not err else ss.result
+        if err:
+            st.warning(err)
+        with st.expander("🔎 Or search a specific place"):
+            q = st.text_input("Place name", key=f"find_{sid}")
+            if st.button("Search", key=f"findbtn_{sid}") and q.strip():
+                anc = anchor_for(i)
+                res, e2 = places_search(q.strip(), anc["lat"] if anc else None, anc["lng"] if anc else None, n=5)
+                if e2:
+                    st.error(e2)
+                elif not res:
+                    st.warning("No match found.")
+                else:
+                    for p in res:
+                        p["reason"] = ""
+                    s["alts"], s["pick"] = res, res[0]
+                    ss[f"alt_{sid}"] = res[0]["id"]
+                    ss.result = None
+        if s["pick"]:
+            place_card(s["pick"])
+            if len(s["alts"]) > 1:
+                st.selectbox(
+                    "Other popular options", [p["id"] for p in s["alts"]], key=f"alt_{sid}",
+                    format_func=lambda pid, alts=s["alts"]: next(
+                        f"{p['name']}" + (f"  ⭐{p['rating']:.1f}" if p.get("rating") else "")
+                        for p in alts if p["id"] == pid),
+                    on_change=on_alt_change, args=(sid,),
+                )
+        st.number_input("Time to spend here (min)", min_value=10, max_value=300, step=5, key=f"visit_{sid}")
+        with st.popover("⋯ Reorder / remove"):
+            st.button("▲ Move up", key=f"up_{sid}", on_click=move_stop, args=(i, -1), disabled=i == 0)
+            st.button("▼ Move down", key=f"dn_{sid}", on_click=move_stop, args=(i, 1),
+                      disabled=i == len(ss.stops) - 1)
+            st.button("✕ Remove stop", key=f"rm_{sid}", on_click=remove_stop, args=(i,),
+                      disabled=len(ss.stops) == 1)
+
+
+def render_stops() -> None:
+    st.subheader("2 · Pick up to 5 stops")
+    if ss.flash:
+        st.warning(ss.flash)
+        ss.flash = None
+    for i, s in enumerate(list(ss.stops)):
+        render_stop(i, s)
+    st.button(f"➕ Add stop ({len(ss.stops)}/{MAX_STOPS})", on_click=add_stop, key="add_stop")
+
+
+# --------------------------------------------------------------------------- #
+# Build + results
+# --------------------------------------------------------------------------- #
+def validate():
+    if not ss.start:
+        return "Set a starting point first (step 1)."
+    for i, s in enumerate(ss.stops, 1):
+        if not s["pick"]:
+            return f"Stop {i} has no place yet - tap “Get AI pick” or search a place."
+    return None
+
+
+def build_route(optimize: bool) -> None:
+    t0 = time.perf_counter()
+    stops = list(ss.stops)
+    note = None
+    if optimize and len(stops) > 1:
+        pts = [ss.start] + [s["pick"] for s in stops]
+        mk = json.dumps(route_sig(pts))
+        if mk not in ss.matrix_cache:
+            ss.matrix_cache[mk] = fetch_matrix(KEY_MAPS, pts)
+        m = ss.matrix_cache[mk]
+        best = best_order(m) if m else None
+        if best:
+            new = [stops[j - 1] for j in best[1]]
+            if [s["id"] for s in new] != [s["id"] for s in stops]:
+                note = ("Stops were reordered to minimize total public transit time: "
+                        + " → ".join(s["pick"]["name"] for s in new))
+                ss.stops = new
+                stops = new
+        else:
+            note = "Could not optimize the order (no transit data for some pairs) - your order was kept."
+    points = [ss.start] + [s["pick"] for s in stops]
+    ensure_legs(points)
+    ss.result = {
+        "sig": route_sig(points), "stop_ids": [s["id"] for s in stops], "note": note,
+        "elapsed": time.perf_counter() - t0,
+    }
+    ss.guide = None
+    for s in stops:
+        ss.pop(f"done_{s['id']}", None)
+
+
+def render_map(points, legs) -> None:
+    paths = []
+    for l in legs:
+        enc = next((l[m].get("polyline") for m in ("TRANSIT", "DRIVE") if l[m].get("ok") and l[m].get("polyline")), None)
+        if enc:
+            paths.append({"path": decode_polyline(enc)})
+        else:
+            paths.append({"path": [[l["from"]["lng"], l["from"]["lat"]], [l["to"]["lng"], l["to"]["lat"]]]})
+    df = pd.DataFrame([
+        {"lat": p["lat"], "lon": p["lng"], "label": f"{i if i else 'Start'} · {p['label']}"}
+        for i, p in enumerate(points)
+    ])
+    layers = [
+        pdk.Layer("PathLayer", data=paths, get_path="path", get_color=[26, 115, 232], width_min_pixels=4),
+        pdk.Layer("ScatterplotLayer", data=df, get_position="[lon, lat]", get_fill_color=[234, 67, 53],
+                  get_radius=60, radius_min_pixels=8, pickable=True),
+    ]
+    try:
+        view = pdk.data_utils.compute_view(df[["lon", "lat"]], 0.9)
+    except Exception:
+        view = pdk.ViewState(latitude=float(df.lat.mean()), longitude=float(df.lon.mean()), zoom=12)
+    st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, tooltip={"text": "{label}"}, map_style=None))
+
+
+def render_route_tab(res, points, legs) -> None:
+    t_sec, t_m = mode_total(legs, "TRANSIT")
+    d_sec, d_m = mode_total(legs, "DRIVE")
+    fare_txt, fare_sub = fare_summary(legs)
+    st.markdown(
+        "<div class='rg-metrics'>"
+        f"<div class='rg-metric'><div class='l'>🚌 Public transit</div><div class='v'>{esc(fmt_dur(t_sec))}</div>"
+        f"<div class='s'>{esc(fmt_km(t_m)) if t_sec is not None else 'A leg has no transit route'}</div></div>"
+        f"<div class='rg-metric'><div class='l'>🚗 Driving</div><div class='v'>{esc(fmt_dur(d_sec))}</div>"
+        f"<div class='s'>{esc(fmt_km(d_m)) if d_sec is not None else 'Driving route unavailable'}</div></div>"
+        f"<div class='rg-metric'><div class='l'>💳 Est. transit fare</div><div class='v'>{esc(fare_txt)}</div>"
+        f"<div class='s'>{esc(fare_sub)}</div></div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"ℹ️ {DISCLAIMER}")
+    if res.get("note"):
+        st.info(res["note"])
+
+    rows = []
+    for i, l in enumerate(legs, 1):
+        t, d = l["TRANSIT"], l["DRIVE"]
+        rows.append({
+            "Leg": i,
+            "From": l["from"]["label"],
+            "To": l["to"]["label"],
+            "Transit": fmt_dur(t["seconds"]) if t["ok"] else f"⚠️ {t.get('error', 'n/a')}",
+            "Fare": (f"{t['fare']['amount']:,.2f} {t['fare']['currency']}" if t["ok"] and t.get("fare")
+                     else "fare not available"),
+            "Lines": ", ".join(t.get("lines", [])) if t["ok"] else "",
+            "Driving": fmt_dur(d["seconds"]) if d["ok"] else f"⚠️ {d.get('error', 'n/a')}",
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True)
+    if any(l[m].get("transient") for l in legs for m in ("TRANSIT", "DRIVE")):
+        st.warning("Some requests failed temporarily. Tap “Build my route” again to retry.")
+    st.caption(f"Calculated in {res['elapsed']:.1f} s · repeated legs are served from the session cache.")
+
+    render_map(points, legs)
+
+    st.markdown("#### Open in Google Maps")
+    mode_label = st.radio("Travel mode", list(MODES), horizontal=True, key="link_mode")
+    mode = MODES[mode_label]
+    url = maps_url(points[-1], points[0], points[1:-1] or None, mode)
+    st.link_button("🗺️ Open full route in Google Maps", url, type="primary", width="stretch")
+    if mode == "transit" and len(points) > 2:
+        st.caption("Google Maps does not support intermediate stops in public transit mode. "
+                   "Open the route leg by leg instead:")
+    with st.expander("Leg-by-leg links", expanded=(mode == "transit" and len(points) > 2)):
+        for i, l in enumerate(legs, 1):
+            st.link_button(f"Leg {i}: {l['from']['label']} → {l['to']['label']}",
+                           maps_url(l["to"], l["from"], None, mode), width="stretch")
+
+
+def render_plan_tab(res, points, legs) -> None:
+    c1, c2 = st.columns(2)
+    start_t = c1.time_input("Start time", dtime(9, 0), key="plan_start")
+    plan_mode_label = c2.radio("Plan travel by", ["Public transit", "Driving"], horizontal=True, key="plan_mode")
+    mode = "TRANSIT" if plan_mode_label == "Public transit" else "DRIVE"
+    visits = [int(ss.get(f"visit_{sid}", 45)) for sid in res["stop_ids"]]
+    tl = build_timeline(points, legs, mode, start_t, visits)
+    if tl is None:
+        st.warning(f"A leg has no {plan_mode_label.lower()} route, so the daily plan cannot be calculated "
+                   "(partial totals are never shown). Replace that stop or switch the travel mode.")
+        return
+
+    if st.button("✨ Generate my AI day guide", key="guide_btn", type="primary"):
+        with st.spinner("Writing your day guide…"):
+            stops_ctx = []
+            for r in tl:
+                p = r["place"]
+                stops_ctx.append({
+                    "index": r["i"], "name": p["name"], "address": p["address"], "type": p.get("type"),
+                    "rating": p.get("rating"), "price": p.get("price"),
+                    "arrive": r["arrive"].strftime("%H:%M"), "leave": r["leave"].strftime("%H:%M"),
+                    "minutes_here": r["visit"], "travel_minutes_to_get_here": round(r["travel"] / 60),
+                })
+            data, err = gemini(
+                "Create a short day guide for this itinerary.\n"
+                f"Start: {points[0]['label']} at {start_t.strftime('%H:%M')} (travel by {plan_mode_label}).\n"
+                f"Traveller preferences: {json.dumps(prefs())}\nStops: {json.dumps(stops_ctx)}\n"
+                'Return JSON: {"summary":"<2 sentences>","stops":[{"index":1,"tip":"<max 30 words: what to do/try here>"}],'
+                '"tips":["<max 4 short practical tips for the whole day>"]}. '
+                "Do not invent opening hours, prices or facts you are not given; suggest checking Google Maps for hours.",
+                "You are RouteGuide, a friendly, concise personal day-planning assistant.", temperature=0.6,
+            )
+        if err:
+            st.error(err)
+        else:
+            ss.guide = data
+
+    guide = ss.guide or {}
+    tips = {int(x.get("index", 0)): x.get("tip", "") for x in guide.get("stops", []) if isinstance(x, dict)}
+    if guide.get("summary"):
+        st.info(guide["summary"])
+    st.markdown(
+        f"<div class='rg-tl'><span class='t'>{start_t.strftime('%H:%M')}</span> · Depart from "
+        f"{esc(points[0]['label'])}</div>", unsafe_allow_html=True)
+    for r in tl:
+        p = r["place"]
+        tip = f"<div class='tip'>💡 {esc(tips[r['i']])}</div>" if tips.get(r["i"]) else ""
+        st.markdown(
+            f"<div class='rg-tl'><span class='t'>{r['arrive'].strftime('%H:%M')} – {r['leave'].strftime('%H:%M')}</span>"
+            f" · <b>{r['i']}. {esc(p['name'])}</b><br>"
+            f"<span style='opacity:.75;font-size:.85rem'>🚶 {fmt_dur(r['travel'])} travel · {r['visit']} min here"
+            f"{' · ⭐ ' + format(p['rating'], '.1f') if p.get('rating') else ''}</span>{tip}</div>",
+            unsafe_allow_html=True)
+    st.success(f"🏁 Back to free time around **{tl[-1]['leave'].strftime('%H:%M')}** · "
+               f"total day length {fmt_dur((tl[-1]['leave'] - datetime.combine(date.today(), start_t)).total_seconds())}")
+    for t in guide.get("tips", []) or []:
+        st.markdown(f"- {t}")
+    st.caption("Waiting time and opening hours are not modelled - check each place on Google Maps.")
+
+
+def render_trip_tab(res, points, legs) -> None:
+    ids = res["stop_ids"]
+    done = [bool(ss.get(f"done_{sid}", False)) for sid in ids]
+    st.progress(sum(done) / len(done), text=f"{sum(done)} of {len(done)} stops visited")
+    nxt = next((i for i, d in enumerate(done) if not d), None)
+    mode = MODES[ss.get("link_mode", "Public transit")]
+    if nxt is None:
+        st.success("🎉 Trip complete - enjoy the rest of your day!")
+    else:
+        p, leg = points[nxt + 1], legs[nxt]
+        eta = leg["TRANSIT"] if leg["TRANSIT"]["ok"] else leg["DRIVE"]
+        eta_txt = f" · about {fmt_dur(eta['seconds'])} from the previous stop" if eta["ok"] else ""
+        st.markdown(
+            f"<div class='rg-next'><b>Next up: {nxt + 1}. {esc(p['name'])}</b><br>"
+            f"<span style='opacity:.8'>{esc(p['address'])}{esc(eta_txt)}</span></div>", unsafe_allow_html=True)
+        # no origin -> Google Maps navigates from the traveller's live position
+        st.link_button("🧭 Navigate to the next stop", maps_url(p, None, None, mode), type="primary", width="stretch")
+    for i, sid in enumerate(ids):
+        st.checkbox(f"{i + 1}. {points[i + 1]['name']}", key=f"done_{sid}")
+
+    st.markdown("#### Ask your guide")
+    with st.form("ask_form", clear_on_submit=True):
+        q = st.text_input("e.g. “Is there a rainy-day alternative?” or “Where can I eat near stop 3?”")
+        sent = st.form_submit_button("Ask")
+    if sent and q.strip():
+        ctx = {
+            "start": points[0]["label"],
+            "stops": [{"n": i + 1, "name": p["name"], "address": p["address"], "visited": done[i]}
+                      for i, p in enumerate(points[1:])],
+            "next_stop": None if nxt is None else points[nxt + 1]["name"],
+            "preferences": prefs(),
+        }
+        with st.spinner("Thinking…"):
+            ans, err = gemini(
+                f"Trip context: {json.dumps(ctx)}\nTraveller question: {q.strip()}\n"
+                "Answer in at most 120 words. Do not invent opening hours or prices; say so if unsure.",
+                "You are RouteGuide, a friendly on-the-go travel assistant.", as_json=False, temperature=0.6)
+        ss.qa.insert(0, (q.strip(), ans if ans else f"⚠️ {err}"))
+        ss.qa = ss.qa[:5]
+    for q, a in ss.qa:
+        st.markdown(f"**You:** {q}")
+        st.markdown(a)
+
+
+def render_build() -> None:
+    st.subheader("3 · Build your route")
+    optimize = st.toggle("Optimize stop order (minimizes public transit time)", value=True, key="optimize")
+    if st.button("🚀 Build my route", type="primary", width="stretch"):
+        problem = validate()
+        if problem:
+            st.warning(problem)
+        else:
+            with st.spinner("Calculating routes…"):
+                build_route(optimize)
+            st.rerun()
+
+    res = ss.result
+    if not res:
+        return
+    points = [ss.start] + [find_stop(sid)["pick"] for sid in res["stop_ids"] if find_stop(sid) and find_stop(sid)["pick"]]
+    if len(points) != len(res["stop_ids"]) + 1 or route_sig(points) != res["sig"]:
+        st.warning("Your itinerary changed - tap “Build my route” to update the results.")
+        return
+    legs = get_legs(points)
+    st.divider()
+    t_route, t_plan, t_trip = st.tabs(["🗺️ Route", "📅 Day plan", "🧭 Trip mode"])
+    with t_route:
+        render_route_tab(res, points, legs)
+    with t_plan:
+        render_plan_tab(res, points, legs)
+    with t_trip:
+        render_trip_tab(res, points, legs)
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    inject_css()
+    st.markdown(
+        "<div class='rg-hero'><h1>🧭 RouteGuide</h1>"
+        "<p>Your AI-powered multi-stop itinerary &amp; transit planner.</p></div>",
+        unsafe_allow_html=True,
+    )
+    if not KEY_MAPS:
+        st.error("`GOOGLE_MAPS_API_KEY` is missing. Add it to Streamlit secrets (see README).")
+        st.code('GOOGLE_MAPS_API_KEY = "your-key"\nGEMINI_API_KEY = "your-key"', language="toml")
+        st.stop()
+    if not KEY_GEM:
+        st.warning("`GEMINI_API_KEY` is missing - recommendations fall back to popularity ranking "
+                   "and AI day guides are disabled.")
+    init_state()
+    render_personalization()
+    render_start()
+    render_stops()
+    render_build()
+    st.divider()
+    st.caption("RouteGuide · Data from Google Maps Platform · AI by Google Gemini · "
+               "Nothing is stored: your session lives only in this browser tab.")
+    if st.button("↺ Start over"):
+        ss.clear()
+        st.rerun()
+
+
+main()
