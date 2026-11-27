@@ -108,7 +108,7 @@ GEMINI_FALLBACKS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-fla
 # --------------------------------------------------------------------------
 CSS = """
 <style>
-.block-container{padding:1rem .9rem 4rem;max-width:760px}
+.block-container{padding:4.2rem .9rem 4rem!important;max-width:760px}
 /* hero */
 .hero{border-radius:22px;padding:1.2rem 1.2rem 1rem;color:#fff;margin-bottom:1rem;
   background:linear-gradient(135deg,#7c3aed 0%,#ec4899 55%,#f59e0b 100%);
