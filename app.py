@@ -22,6 +22,7 @@ import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from itertools import permutations
 from urllib.parse import urlencode
 
@@ -45,17 +46,25 @@ PRESET_SPOTS = {
     "Clock Tower, Konak": "Izmir Clock Tower, Konak, Izmir",
 }
 
+# label -> (Places query, default stay in minutes, best time of day)
 CATEGORIES = {
-    "☕ Café": "best cafe",
-    "🍽️ Restaurant": "restaurant",
-    "🏛️ Museum": "museum",
-    "🌳 Park & nature": "park",
-    "🕌 Historical site": "historical landmark",
-    "🛍️ Shopping": "shopping",
-    "🍰 Dessert": "dessert shop",
-    "🌅 Viewpoint": "scenic viewpoint",
-    "🍸 Bar": "bar",
+    "☕ Café": {"q": "best cafe", "stay": 45, "slot": "any"},
+    "🍽️ Restaurant": {"q": "restaurant", "stay": 60, "slot": "midday"},
+    "🏛️ Museum": {"q": "museum", "stay": 90, "slot": "morning"},
+    "🌳 Park & nature": {"q": "park", "stay": 60, "slot": "any"},
+    "🕌 Historical site": {"q": "historical landmark", "stay": 60, "slot": "morning"},
+    "🛍️ Shopping": {"q": "shopping", "stay": 60, "slot": "afternoon"},
+    "🍰 Dessert": {"q": "dessert shop", "stay": 30, "slot": "afternoon"},
+    "🌅 Viewpoint": {"q": "scenic viewpoint", "stay": 30, "slot": "evening"},
+    "🍸 Bar": {"q": "bar", "stay": 60, "slot": "evening"},
 }
+SLOTS = {"any": "Any time", "morning": "Morning", "midday": "Midday",
+         "afternoon": "Afternoon", "evening": "Evening"}
+SLOT_WINDOWS = {"morning": (6 * 60, 12 * 60), "midday": (11 * 60 + 30, 14 * 60 + 30),
+                "afternoon": (12 * 60, 18 * 60), "evening": (17 * 60, 23 * 60)}
+VISIT_OPTIONS = [15, 30, 45, 60, 90, 120, 150, 180, 240]
+DEFAULT_STAY = 45
+PALETTE = ["#7c3aed", "#ec4899", "#f59e0b", "#10b981", "#3b82f6"]
 DEFAULT_PLAN_QUERIES = [
     "popular tourist attraction", "best restaurant", "best cafe", "museum", "park",
 ]
@@ -89,32 +98,108 @@ def _secret(name: str, default=None):
 
 MAPS_KEY = _secret("GOOGLE_MAPS_API_KEY")
 GEMINI_KEY = _secret("GEMINI_API_KEY")
-GEMINI_MODEL = _secret("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = _secret("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# If the chosen model returns 404 (retired / not available to this project),
+# the next ones are tried automatically.
+GEMINI_FALLBACKS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
 
 # --------------------------------------------------------------------------
 # Styling (mobile first, works down to 375px, no horizontal scrolling)
 # --------------------------------------------------------------------------
 CSS = """
 <style>
-.block-container{padding:1.2rem .9rem 4rem;max-width:760px}
-h1{font-size:1.8rem!important;margin-bottom:0}
-h3{font-size:1.15rem!important}
+.block-container{padding:1rem .9rem 4rem;max-width:760px}
+/* hero */
+.hero{border-radius:22px;padding:1.2rem 1.2rem 1rem;color:#fff;margin-bottom:1rem;
+  background:linear-gradient(135deg,#7c3aed 0%,#ec4899 55%,#f59e0b 100%);
+  box-shadow:0 8px 24px rgba(124,58,237,.28)}
+.hero .t{font-size:2rem;font-weight:900;line-height:1.1;letter-spacing:-.5px}
+.hero .s{opacity:.95;margin:.25rem 0 .7rem;font-size:.98rem}
+.hero .chips span{display:inline-block;background:rgba(255,255,255,.22);border-radius:999px;
+  padding:.15rem .6rem;margin:0 .3rem .3rem 0;font-size:.78rem;font-weight:600}
+/* step headers */
+.step{display:flex;align-items:center;gap:.6rem;margin:.6rem 0 .7rem;font-size:1.25rem;font-weight:800}
+.step .n{flex:none;width:2.1rem;height:2.1rem;border-radius:50%;display:grid;place-items:center;
+  color:#fff;font-weight:800;box-shadow:0 3px 10px rgba(0,0,0,.18)}
 /* keep small button rows side by side on phones */
 div[data-testid="stHorizontalBlock"]{flex-wrap:nowrap!important;gap:.4rem!important}
 div[data-testid="stColumn"],div[data-testid="column"]{min-width:0!important;flex:1 1 0!important;width:auto!important}
-.stButton>button,.stLinkButton>a{width:100%}
-.sub{opacity:.7;font-size:.85rem;word-break:break-word}
+.stButton>button,.stLinkButton>a,.stDownloadButton>button{width:100%}
+[data-testid^="stBaseButton-secondary"],[data-testid="stBaseLinkButton-secondary"]{border-radius:12px!important}
+button[kind="primary"],[data-testid="stBaseButton-primary"],[data-testid="stBaseLinkButton-primary"]{
+  background:linear-gradient(135deg,#7c3aed,#ec4899)!important;border:none!important;color:#fff!important;
+  font-weight:700!important;border-radius:12px!important;box-shadow:0 4px 14px rgba(236,72,153,.3)}
+[data-testid="stBaseButton-secondaryFormSubmit"]{background:linear-gradient(135deg,#0ea5e9,#10b981)!important;
+  color:#fff!important;border:none!important;font-weight:700!important}
+div[data-baseweb="tab-highlight"]{background:linear-gradient(90deg,#7c3aed,#ec4899)!important;height:3px!important}
+button[data-baseweb="tab"]{font-weight:700}
+/* cards */
+.sub{opacity:.72;font-size:.85rem;word-break:break-word}
+.card{display:flex;gap:.7rem;align-items:flex-start;border:1px solid rgba(128,128,128,.25);
+  border-left:6px solid var(--c);border-radius:14px;padding:.6rem .8rem;margin-bottom:.45rem;
+  background:linear-gradient(90deg,color-mix(in srgb,var(--c) 12%,transparent),transparent)}
+.card .bd{flex:none;min-width:1.8rem;height:1.8rem;border-radius:50%;background:var(--c);color:#fff;
+  display:grid;place-items:center;font-weight:800;font-size:.9rem}
+.card .tx{min-width:0;flex:1}
+.startcard{border-radius:16px;padding:.8rem 1rem;color:#fff;margin-bottom:.5rem;
+  background:linear-gradient(135deg,#10b981,#0ea5e9)}
+.startcard .sub{color:#fff;opacity:.9}
+.pips{display:flex;gap:.35rem;align-items:center;margin:.2rem 0 .7rem}
+.pip{width:100%;max-width:56px;height:10px;border-radius:999px;background:rgba(128,128,128,.25)}
+.pip.on{background:var(--c)}
+.pips .cnt{margin-left:.4rem;font-weight:700;font-size:.85rem;white-space:nowrap}
+.daycard{border-radius:16px;padding:.8rem 1rem;margin:.2rem 0 .8rem;
+  background:linear-gradient(135deg,rgba(124,58,237,.14),rgba(236,72,153,.14));
+  border:1px solid rgba(124,58,237,.35)}
+/* comparison + fare */
 .cmp{display:flex;gap:.6rem;flex-wrap:wrap;margin:.4rem 0 .8rem}
-.cmp .box{flex:1 1 140px;border:1px solid rgba(128,128,128,.35);border-radius:12px;padding:.7rem .8rem}
-.cmp .box.win{border:2px solid #2e9e5b;background:rgba(46,158,91,.08)}
+.cmp .box{flex:1 1 140px;border:1px solid rgba(128,128,128,.35);border-radius:14px;padding:.7rem .8rem}
+.cmp .box.win{border:2px solid #10b981;background:rgba(16,185,129,.1)}
 .cmp .lbl{font-size:.85rem;opacity:.8}
-.cmp .val{font-size:1.4rem;font-weight:700;line-height:1.3}
+.cmp .val{font-size:1.4rem;font-weight:800;line-height:1.3}
 .cmp .badge{display:inline-block;margin-top:.2rem;font-size:.7rem;font-weight:700;
-  padding:.05rem .45rem;border-radius:999px;background:#2e9e5b;color:#fff}
-.fare{border:1px dashed rgba(128,128,128,.5);border-radius:12px;padding:.6rem .8rem;margin-bottom:.6rem}
+  padding:.05rem .45rem;border-radius:999px;background:#10b981;color:#fff}
+.fare{border:2px dashed #f59e0b;border-radius:14px;padding:.6rem .8rem;margin-bottom:.6rem;
+  background:rgba(245,158,11,.08)}
 .fare b{font-size:1.2rem}
+/* agenda timeline */
+.tl{margin:.4rem 0 1rem}
+.tl-row{display:flex;gap:.55rem}
+.tl-time{flex:none;width:3.1rem;text-align:right;font-weight:800;font-size:.92rem;
+  font-variant-numeric:tabular-nums;padding-top:.05rem}
+.tl-rail{flex:none;width:16px;display:flex;flex-direction:column;align-items:center}
+.tl-dot{flex:none;width:14px;height:14px;border-radius:50%;background:var(--c);
+  box-shadow:0 0 0 4px color-mix(in srgb,var(--c) 22%,transparent);margin-top:.15rem}
+.tl-dot.sm{width:8px;height:8px;margin-top:.3rem;box-shadow:none;opacity:.7}
+.tl-line{flex:1;width:3px;min-height:12px;background:linear-gradient(var(--c),rgba(128,128,128,.25))}
+.tl-body{flex:1;min-width:0;padding-bottom:.65rem}
+.tl-card{border-radius:14px;padding:.55rem .8rem;border:1px solid rgba(128,128,128,.25);
+  border-left:6px solid var(--c);
+  background:linear-gradient(90deg,color-mix(in srgb,var(--c) 12%,transparent),transparent)}
+.tl-card .ttl{font-weight:800}
+.tl-travel{font-size:.84rem;opacity:.85;padding:.1rem 0 .1rem .1rem}
+.tl-end{font-weight:800}
 </style>
 """
+
+HERO = """
+<div class="hero"><div class="t">🧭 RouteGuide</div>
+<div class="s">Plan your day, hop between stops, see the fare.</div>
+<div class="chips"><span>📍 Locate</span><span>✨ AI picks</span><span>🗓️ Timed agenda</span>
+<span>🚌 Transit vs 🚗 Drive</span><span>🗺️ Maps export</span></div></div>
+"""
+
+
+def step_header(n: int, title: str, color: str):
+    st.markdown(f"<div class='step'><span class='n' style='background:{color}'>{n}</span>"
+                f"{title}</div>", unsafe_allow_html=True)
+
+
+def card_html(badge: str, name: str, lines: list[str], color: str) -> str:
+    sub = "".join(f"<div class='sub'>{safe(x)}</div>" for x in lines if x)
+    return (f"<div class='card' style='--c:{color}'><span class='bd'>{badge}</span>"
+            f"<div class='tx'><b>{safe(name)}</b>{sub}</div></div>")
+
 
 # --------------------------------------------------------------------------
 # Session state (stateless app: nothing leaves st.session_state, NFR-04)
@@ -127,7 +212,7 @@ DEFAULTS = dict(
     ai_picks=[], ai_idx=0,
     plan=None, plan_no=0,
     result=None, gen_error=None,
-    optimize=True,
+    optimize=True, day_hours=None, day_summary="", auto_generate=False,
     cache={}, flash={},
 )
 
@@ -183,6 +268,15 @@ CURRENCY = {"TRY": "₺", "USD": "$", "EUR": "€", "GBP": "£"}
 def fmt_money(amount: float, cur: str) -> str:
     sym = CURRENCY.get(cur)
     return f"{sym}{amount:,.2f}" if sym else f"{amount:,.2f} {cur}"
+
+
+def snap(m) -> int:
+    return min(VISIT_OPTIONS, key=lambda o: abs(o - int(m or DEFAULT_STAY)))
+
+
+def slot_penalty(slot: str, minute: int) -> int:
+    w = SLOT_WINDOWS.get(slot)
+    return max(0, w[0] - minute, minute - w[1]) if w else 0
 
 
 def maps_url(origin: dict, dests: list[dict], mode: str) -> str:
@@ -379,16 +473,25 @@ def ensure_legs(pairs: list[tuple[dict, dict]], mode: str) -> list[dict]:
 def gemini_json(prompt: str, system: str, temperature: float = 0.4):
     if not GEMINI_KEY:
         raise ApiError("Gemini API key is not configured.")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     body = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": temperature,
                              "responseMimeType": "application/json"},
     }
-    r = _http("POST", url, json=body, headers={
-        "Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY}, )
+    models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACKS if m != GEMINI_MODEL]
+    r = None
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        r = _http("POST", url, json=body, headers={
+            "Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY})
+        if r.status_code != 404:
+            break
+        log.warning("Gemini model %s returned 404, trying next", model)
     if r.status_code != 200:
+        if r.status_code == 404:
+            raise ApiError("Gemini: none of the configured models is available to this key. "
+                           "Set GEMINI_MODEL in the app secrets.")
         _raise_for(r, "Gemini")
     try:
         parts = r.json()["candidates"][0]["content"]["parts"]
@@ -439,7 +542,7 @@ def candidate_payload(cands: list[dict]) -> list[dict]:
 def ai_popular_picks(category_label: str, prefs: str) -> list[dict]:
     """UC-03: returns ranked, Places-verified picks (never unverified ones)."""
     anchor = ss.stops[-1] if ss.stops else ss.start
-    cands = gather_candidates([CATEGORIES[category_label]], anchor)
+    cands = gather_candidates([CATEGORIES[category_label]["q"]], anchor)
     if not cands:
         return []
     prompt = json.dumps({
@@ -456,7 +559,9 @@ def ai_popular_picks(category_label: str, prefs: str) -> list[dict]:
     for item in (data.get("picks") if isinstance(data, dict) else None) or []:
         c = cmap.get(str(item.get("cid")))
         if c and all(c["id"] != p["id"] for p in picks):
-            picks.append(dict(c, rationale=str(item.get("rationale", ""))[:400]))
+            picks.append(dict(c, rationale=str(item.get("rationale", ""))[:400],
+                              visit_minutes=CATEGORIES[category_label]["stay"],
+                              slot=CATEGORIES[category_label]["slot"]))
     return picks
 
 
@@ -487,13 +592,13 @@ def daily_plan(interests: str, hours: int, pace: str, budget: str) -> dict:
         "pace": pace, "target_number_of_venues_for_pace": PACE_TARGET[pace],
         "budget": budget,
         "rules": "Total visit_minutes must fit within available hours, leaving about 20% "
-                 "for travel. Respect the budget using each candidate's price level.",
+                 "for travel. Respect the budget using each candidate's price level. Give every pick a 'slot' chosen from: morning, midday, afternoon, evening, any (e.g. museums in the morning, restaurants at midday or evening, viewpoints near sunset, bars in the evening).",
         "start": anchor["address"] or anchor["name"],
         "existing_stops": [s["name"] for s in ss.stops],
         "candidates": candidate_payload(cands),
         "output_format": {"summary": "<2 sentence overview>",
                           "picks": [{"cid": "<cid>", "rationale": "<why>",
-                                     "visit_minutes": 60}]},
+                                     "visit_minutes": 60, "slot": "midday"}]},
     }, ensure_ascii=False)
     data = gemini_json(prompt, REC_SYSTEM)
     cmap = {c["cid"]: c for c in cands}
@@ -506,7 +611,9 @@ def daily_plan(interests: str, hours: int, pace: str, budget: str) -> dict:
             vm = max(15, min(240, int(item.get("visit_minutes", 60))))
         except (TypeError, ValueError):
             vm = 60
-        picks.append(dict(c, rationale=str(item.get("rationale", ""))[:400], visit_minutes=vm))
+        slot = str(item.get("slot", "any")).lower()
+        picks.append(dict(c, rationale=str(item.get("rationale", ""))[:400],
+                          visit_minutes=snap(vm), slot=slot if slot in SLOTS else "any"))
     summary = str(data.get("summary", ""))[:500] if isinstance(data, dict) else ""
     return {"picks": picks[:5], "summary": summary, "notice": notice, "hours": hours}
 
@@ -523,8 +630,12 @@ def add_stop(place: dict) -> tuple[bool, str]:
     for s in ss.stops:
         if s["id"] == place["id"] or haversine_km(s["lat"], s["lng"], place["lat"], place["lng"]) < 0.03:
             return False, f"“{place['name']}” is already in your itinerary."
-    keep = ("id", "name", "address", "lat", "lng", "rating", "reviews", "price", "type", "uri")
-    ss.stops.append({k: place.get(k) for k in keep})
+    keep = ("id", "name", "address", "lat", "lng", "rating", "reviews", "price", "type",
+            "uri", "rationale")
+    stop = {k: place.get(k) for k in keep}
+    stop["visit_minutes"] = snap(place.get("visit_minutes") or DEFAULT_STAY)
+    stop["slot"] = place.get("slot") if place.get("slot") in SLOTS else "any"
+    ss.stops.append(stop)
     return True, f"Added “{place['name']}”."
 
 
@@ -575,7 +686,9 @@ def cb_add_plan_selection():
               f"Added {added} of {len(chosen)} selected venues. The limit is {MAX_STOPS} "
               "stops (or a venue was already in your list).")
     else:
-        flash("stops", "success", f"Added {added} venue(s) to your itinerary.")
+        flash("stops", "success", f"Added {added} venue(s). Your day is being built below.")
+    if added:
+        ss.auto_generate = True
     ss.plan = None
 
 
@@ -704,10 +817,12 @@ def start_search_tab():
 
 
 def section_start():
-    st.markdown("### 1 · Starting point")
+    step_header(1, "Where are you starting?", "#10b981")
     if ss.start:
         s = ss.start
-        st.success(f"📍 **{s['name']}**" + (f"  \n{s['address']}" if s["address"] and s["address"] != s["name"] else ""))
+        addr = s["address"] if s["address"] and s["address"] != s["name"] else ""
+        st.markdown(f"<div class='startcard'>📍 <b>{safe(s['name'])}</b>"
+                    f"<div class='sub'>{safe(addr)}</div></div>", unsafe_allow_html=True)
         show_flash("start_saved")
         c1, c2, c3 = st.columns(3)
         c1.button("Change", on_click=cb_clear_start, key="chg_start")
@@ -739,8 +854,10 @@ def stars(p: dict) -> str:
 
 
 def pick_card(p: dict):
-    st.markdown(f"**{safe(p['name'])}**  \n<span class='sub'>{safe(stars(p))}</span>  \n"
-                f"<span class='sub'>{safe(p['address'])}</span>", unsafe_allow_html=True)
+    meta = [stars(p), p["address"]]
+    if p.get("slot") and p["slot"] != "any":
+        meta.insert(1, f"🕐 {SLOTS[p['slot']]} · ~{p.get('visit_minutes', DEFAULT_STAY)} min")
+    st.markdown(card_html("✨", p["name"], meta, "#7c3aed"), unsafe_allow_html=True)
     if p.get("rationale"):
         st.markdown(f"💡 {safe(p['rationale'])}", unsafe_allow_html=True)
 
@@ -797,6 +914,8 @@ def tab_ai_pick(full: bool):
 
 
 def tab_daily_plan(full: bool, remaining: int):
+    st.caption("Tell me about your day. I pick the places, then build a timed agenda "
+               "and the best route between them.")
     with st.form("plan_form"):
         interests = st.text_area("Interests", placeholder="e.g. history, street food, sea views",
                                  height=80)
@@ -812,6 +931,9 @@ def tab_daily_plan(full: bool, remaining: int):
             if not ss.plan["picks"]:
                 st.warning("No results found. Try different interests or search manually.")
                 ss.plan = None
+            else:
+                ss.day_hours = hours
+                ss.day_summary = ss.plan.get("summary", "")
         except ApiError as e:
             ss.plan = None
             st.error(f"Suggestions unavailable right now. You can still add stops manually. ({e})")
@@ -820,45 +942,58 @@ def tab_daily_plan(full: bool, remaining: int):
         if plan.get("notice"):
             st.info(plan["notice"])
         if plan.get("summary"):
-            st.markdown(f"🗒️ {safe(plan['summary'])}", unsafe_allow_html=True)
+            st.markdown(f"<div class='daycard'>🗒️ {safe(plan['summary'])}</div>",
+                        unsafe_allow_html=True)
         total = 0
         for i, p in enumerate(plan["picks"]):
-            with st.container(border=True):
-                on = st.checkbox(f"**{p['name']}**", value=i < remaining, key=f"plan_{ss.plan_no}_{i}")
-                st.markdown(f"<span class='sub'>{safe(stars(p))} · ~{p['visit_minutes']} min</span>",
-                            unsafe_allow_html=True)
-                st.markdown(f"💡 {safe(p['rationale'])}", unsafe_allow_html=True)
-                if on:
-                    total += p["visit_minutes"]
+            color = PALETTE[i % len(PALETTE)]
+            on = st.checkbox(f"**{p['name']}**", value=i < remaining, key=f"plan_{ss.plan_no}_{i}")
+            st.markdown(card_html(str(i + 1), p["name"],
+                                  [stars(p), f"🕐 {SLOTS[p['slot']]} · ~{p['visit_minutes']} min",
+                                   p["address"]], color)
+                        + f"<div class='sub' style='margin:-.2rem 0 .6rem'>💡 {safe(p['rationale'])}</div>",
+                        unsafe_allow_html=True)
+            if on:
+                total += p["visit_minutes"]
         st.caption(f"Selected visit time: ~{fmt_dur(total * 60)} of {plan['hours']} h available "
                    "(travel time not included).")
-        st.button("➕ Add selected to itinerary", on_click=cb_add_plan_selection, key="plan_add")
+        st.button("➕ Add selected & build my day", on_click=cb_add_plan_selection,
+                  key="plan_add", type="primary")
 
 
 def section_stops():
-    st.markdown("### 2 · Stops")
+    step_header(2, "Pick your stops", "#7c3aed")
     if not ss.start:
         st.info("Set a starting point first. Stops can be added once it is confirmed.")
         return
     n = len(ss.stops)
     full = n >= MAX_STOPS
-    st.progress(n / MAX_STOPS, text=f"Stops: {n}/{MAX_STOPS}")
+    pips = "".join(f"<span class='pip{' on' if i < n else ''}' style='--c:{PALETTE[i]}'></span>"
+                   for i in range(MAX_STOPS))
+    st.markdown(f"<div class='pips'>{pips}<span class='cnt'>{n}/{MAX_STOPS} stops</span></div>",
+                unsafe_allow_html=True)
     show_flash("stops")
     if full:
         st.warning(f"Limit reached: a maximum of {MAX_STOPS} stops is allowed. "
                    "Remove a stop to add another.")
-    if ss.stops:
-        st.markdown(f"🟢 **Start:** {safe(ss.start['name'])}", unsafe_allow_html=True)
     for i, s in enumerate(ss.stops):
-        with st.container(border=True):
-            st.markdown(f"**{i + 1}. {safe(s['name'])}**  \n<span class='sub'>{safe(stars(s))}</span>  \n"
-                        f"<span class='sub'>{safe(s['address'])}</span>", unsafe_allow_html=True)
-            c1, c2, c3 = st.columns(3)
-            c1.button("⬆", key=f"up_{s['id']}", on_click=cb_move, args=(i, -1),
-                      disabled=i == 0, help="Move up")
-            c2.button("⬇", key=f"dn_{s['id']}", on_click=cb_move, args=(i, 1),
-                      disabled=i == n - 1, help="Move down")
-            c3.button("🗑", key=f"rm_{s['id']}", on_click=cb_remove, args=(i,), help="Remove")
+        color = PALETTE[i % len(PALETTE)]
+        st.markdown(card_html(str(i + 1), s["name"], [stars(s), s["address"]], color),
+                    unsafe_allow_html=True)
+        slot_keys = list(SLOTS)
+        a, b = st.columns(2)
+        s["visit_minutes"] = a.selectbox(
+            "Stay", VISIT_OPTIONS, index=VISIT_OPTIONS.index(snap(s.get("visit_minutes"))),
+            format_func=lambda m: f"⏱ {m} min", key=f"vm_{s['id']}")
+        s["slot"] = b.selectbox(
+            "Best time", slot_keys, index=slot_keys.index(s.get("slot", "any")),
+            format_func=lambda k: f"🕐 {SLOTS[k]}", key=f"sl_{s['id']}")
+        c1, c2, c3 = st.columns(3)
+        c1.button("⬆", key=f"up_{s['id']}", on_click=cb_move, args=(i, -1),
+                  disabled=i == 0, help="Move up")
+        c2.button("⬇", key=f"dn_{s['id']}", on_click=cb_move, args=(i, 1),
+                  disabled=i == n - 1, help="Move down")
+        c3.button("🗑", key=f"rm_{s['id']}", on_click=cb_remove, args=(i,), help="Remove")
     t1, t2, t3 = st.tabs(["🔎 Search", "✨ AI pick", "🗓️ Daily plan"])
     with t1:
         tab_search_stop(full)
@@ -878,21 +1013,27 @@ def current_signature() -> str:
         [p["id"] for p in ss.stops], bool(ss.optimize)])
 
 
-def best_order(M: dict, n: int) -> list[int]:
-    """Python sequencing logic: minimize total transit time (start fixed).
-    Legs without a transit route are avoided first, then total time is minimized."""
+def best_order(M: dict, n: int, visits: dict, slots: dict, start_min: int) -> list[int]:
+    """Python sequencing logic (start fixed). Priorities: 1) avoid legs without a transit
+    route, 2) respect each stop's best time of day (simulated clock), 3) minimize total
+    public transit time."""
     best = None
     for perm in permutations(range(1, n + 1)):
-        miss, tot, prev = 0, 0, 0
+        miss = tot = pen = 0
+        prev, clock = 0, start_min
         for j in perm:
             v = M[(prev, j)]
             if v is None:
                 miss += 1
+                clock += 20
             else:
                 tot += v
+                clock += math.ceil(v / 60)
+            pen += slot_penalty(slots[j], clock)
+            clock += visits[j]
             prev = j
-        if best is None or (miss, tot) < best[0]:
-            best = ((miss, tot), perm)
+        if best is None or (miss, pen, tot) < best[0]:
+            best = ((miss, pen, tot), perm)
     return list(best[1])
 
 
@@ -913,7 +1054,10 @@ def generate():
             pairs = [(i, j) for i in range(n + 1) for j in range(1, n + 1) if i != j]
             legs = ensure_legs([(nodes[i], nodes[j]) for i, j in pairs], "TRANSIT")
             M = {p: (l["seconds"] if l["status"] == "ok" else None) for p, l in zip(pairs, legs)}
-            order = best_order(M, n)
+            visits = {i + 1: int(stops[i].get("visit_minutes") or DEFAULT_STAY) for i in range(n)}
+            slots = {i + 1: stops[i].get("slot", "any") for i in range(n)}
+            dstart = ss.get("day_start_time", dtime(9, 0))
+            order = best_order(M, n, visits, slots, dstart.hour * 60 + dstart.minute)
         else:
             order = list(range(1, n + 1))
         seq = [start] + [nodes[k] for k in order]
@@ -944,6 +1088,7 @@ def generate():
     ss.result = {
         "signature": current_signature(),
         "sequence": [p["name"] for p in seq],
+        "ordered": seq,
         "legs": legs_out,
         "transit_total": sum(l["transit"]["seconds"] for l in legs_out) if t_ok else None,
         "driving_total": sum(l["driving"]["seconds"] for l in legs_out) if d_ok else None,
@@ -987,16 +1132,137 @@ def fare_summary(legs: list[dict]):
     return head, note
 
 
-def render_results():
-    r = ss.result
-    if ss.gen_error:
-        st.error(ss.gen_error)
-    if not r:
-        return
-    if r["signature"] != current_signature():
-        st.info("Your start point, stops or settings changed after the last calculation. "
-                "The old route and export link are disabled: press **Generate itinerary** again.")
-        return
+def build_agenda(r: dict, day_start: datetime, mode: str):
+    """Turn the optimized route into a timed agenda (travel + stay for every stop)."""
+    seq, legs = r["ordered"], r["legs"]
+    by_id = {s["id"]: s for s in ss.stops}
+    t = day_start
+    items = [{"kind": "start", "start": t, "end": t, "title": seq[0]["name"],
+              "sub": "Your day begins", "color": "#10b981"}]
+    unknown, mismatch = [], []
+    for i, leg in enumerate(legs):
+        dest = seq[i + 1]
+        stop = by_id.get(dest["id"], dest)
+        tr, dr = leg["transit"], leg["driving"]
+        order = [("🚌", tr), ("🚗", dr)] if mode == "Public transit" else [("🚗", dr), ("🚌", tr)]
+        chosen = next(((ic, x) for ic, x in order if x and x["status"] == "ok"), None)
+        secs, icon, note = 0, "❔", ""
+        if chosen:
+            icon, x = chosen
+            secs = x["seconds"]
+            if (icon == "🚌") != (mode == "Public transit"):
+                note = "no route for the chosen mode, other mode used"
+            elif icon == "🚌" and x.get("fare"):
+                note = "est. fare " + fmt_money(x["fare"]["amount"], x["fare"]["currency"])
+        else:
+            unknown.append(i + 1)
+        depart = t
+        t = t + timedelta(minutes=math.ceil(secs / 60))
+        items.append({"kind": "travel", "start": depart, "end": t,
+                      "title": f"{icon} {fmt_dur(secs) if chosen else 'travel time unknown'} to {dest['name']}",
+                      "sub": note})
+        stay = int(stop.get("visit_minutes") or DEFAULT_STAY)
+        arrive = t
+        t = t + timedelta(minutes=stay)
+        slot = stop.get("slot", "any")
+        if slot_penalty(slot, arrive.hour * 60 + arrive.minute) > 0:
+            mismatch.append(f"{dest['name']} starts at {arrive:%H:%M}, outside its preferred "
+                            f"{SLOTS[slot].lower()} window.")
+        items.append({"kind": "visit", "start": arrive, "end": t, "title": dest["name"],
+                      "sub": f"{stay} min · until {t:%H:%M}", "addr": dest.get("address", ""),
+                      "extra": stop.get("rationale") or "", "color": PALETTE[i % len(PALETTE)]})
+    items.append({"kind": "end", "start": t, "end": t, "title": "Day wraps up 🎉",
+                  "sub": "", "color": "#f59e0b"})
+    return items, unknown, mismatch
+
+
+def timeline_html(items: list[dict]) -> str:
+    rows = []
+    for k, it in enumerate(items):
+        color = it.get("color", "#94a3b8")
+        last = k == len(items) - 1
+        if it["kind"] == "travel":
+            dot = "<span class='tl-dot sm'></span>"
+            body = (f"<div class='tl-travel'>{safe(it['title'])}"
+                    + (f"<div class='sub'>{safe(it['sub'])}</div>" if it["sub"] else "") + "</div>")
+        elif it["kind"] == "visit":
+            dot = "<span class='tl-dot'></span>"
+            extra = f"<div class='sub'>💡 {safe(it['extra'])}</div>" if it["extra"] else ""
+            body = (f"<div class='tl-card'><div class='ttl'>{safe(it['title'])}</div>"
+                    f"<div class='sub'>{safe(it['sub'])}</div>"
+                    f"<div class='sub'>{safe(it['addr'])}</div>{extra}</div>")
+        elif it["kind"] == "start":
+            dot = "<span class='tl-dot'></span>"
+            body = (f"<div class='tl-card'><div class='ttl'>🟢 {safe(it['title'])}</div>"
+                    f"<div class='sub'>{safe(it['sub'])}</div></div>")
+        else:
+            dot = "<span class='tl-dot'></span>"
+            body = f"<div class='tl-end'>{safe(it['title'])}</div>"
+        line = "" if last else "<span class='tl-line'></span>"
+        rows.append(f"<div class='tl-row' style='--c:{color}'>"
+                    f"<div class='tl-time'>{it['start']:%H:%M}</div>"
+                    f"<div class='tl-rail'>{dot}{line}</div><div class='tl-body'>{body}</div></div>")
+    return "<div class='tl'>" + "".join(rows) + "</div>"
+
+
+def ics_escape(text) -> str:
+    return (str(text or "").replace("\\", "\\\\").replace(";", "\\;")
+            .replace(",", "\\,").replace("\n", "\\n"))
+
+
+def build_ics(items: list[dict]) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//RouteGuide//Daily Plan//EN",
+           "CALSCALE:GREGORIAN"]
+    for n, it in enumerate(items):
+        if it["kind"] not in ("visit", "travel"):
+            continue
+        title = it["title"] if it["kind"] == "visit" else "Travel: " + it["title"]
+        out += ["BEGIN:VEVENT", f"UID:rg-{stamp}-{n}@routeguide", f"DTSTAMP:{stamp}",
+                f"DTSTART:{it['start']:%Y%m%dT%H%M%S}", f"DTEND:{it['end']:%Y%m%dT%H%M%S}",
+                f"SUMMARY:{ics_escape(title)}"]
+        if it.get("addr"):
+            out.append(f"LOCATION:{ics_escape(it['addr'])}")
+        desc = it.get("extra") or it.get("sub")
+        if desc:
+            out.append(f"DESCRIPTION:{ics_escape(desc)}")
+        out.append("END:VEVENT")
+    out.append("END:VCALENDAR")
+    return "\r\n".join(out)
+
+
+def render_agenda(r: dict):
+    mode = st.radio("Travel between stops by", ["Public transit", "Driving"],
+                    horizontal=True, key="agenda_mode")
+    day_start = datetime.combine(ss.get("day_date", date.today()),
+                                 ss.get("day_start_time", dtime(9, 0)))
+    items, unknown, mismatch = build_agenda(r, day_start, mode)
+    if ss.day_summary:
+        st.markdown(f"<div class='daycard'>🗒️ {safe(ss.day_summary)}</div>", unsafe_allow_html=True)
+    st.markdown(timeline_html(items), unsafe_allow_html=True)
+    total_min = int((items[-1]["start"] - day_start).total_seconds() // 60)
+    st.caption(f"Your day runs {day_start:%H:%M} → {items[-1]['start']:%H:%M} "
+               f"({fmt_dur(total_min * 60)} including travel).")
+    if ss.day_hours:
+        if total_min > ss.day_hours * 60:
+            st.warning(f"This plan takes about {fmt_dur(total_min * 60)}, more than your "
+                       f"{ss.day_hours} h. Remove a stop or shorten a stay.")
+        else:
+            st.success(f"Fits your {ss.day_hours} h. 👍")
+    if unknown:
+        st.warning(f"Travel time is unknown for leg(s) {', '.join(map(str, unknown))}, "
+                   "so those legs are counted as 0 min.")
+    for m in mismatch[:3]:
+        st.info("⏰ " + m)
+    if mode == "Public transit":
+        st.caption("ℹ️ " + FARE_DISCLAIMER)
+    st.caption("Changed the start time, stay times or best times? Press **Generate** again "
+               "to re-sequence the stops (cached legs are reused).")
+    st.download_button("📅 Add to calendar (.ics)", data=build_ics(items),
+                       file_name="routeguide-day-plan.ics", mime="text/calendar", key="ics_dl")
+
+
+def render_route(r: dict):
     legs = r["legs"]
     st.markdown("#### Optimized route")
     st.markdown("  \n".join(
@@ -1052,14 +1318,36 @@ def render_results():
               key="refresh_legs", help="Clears cached legs so the next calculation is fresh.")
 
 
-def section_generate():
-    st.markdown("### 3 · Itinerary")
-    if not ss.start:
-        st.info("Set a starting point and add stops to generate your itinerary.")
+def render_results():
+    r = ss.result
+    if ss.gen_error:
+        st.error(ss.gen_error)
+    if not r:
         return
-    st.checkbox("Optimize stop order for the shortest public transit time", key="optimize")
-    if st.button("🚀 Generate itinerary", type="primary", use_container_width=True, key="gen"):
-        with st.spinner("Calculating legs..."):
+    if r["signature"] != current_signature():
+        st.info("Your start point or stops changed after the last calculation. "
+                "The old agenda, route and export link are disabled: press "
+                "**Build my day** again.")
+        return
+    t1, t2 = st.tabs(["🗓️ Daily agenda", "🗺️ Route & compare"])
+    with t1:
+        render_agenda(r)
+    with t2:
+        render_route(r)
+
+
+def section_generate():
+    step_header(3, "Your day & route", "#f59e0b")
+    if not ss.start:
+        st.info("Set a starting point and add stops to build your day.")
+        return
+    c1, c2 = st.columns(2)
+    c1.date_input("Date", value=date.today(), key="day_date")
+    c2.time_input("Day starts at", value=dtime(9, 0), key="day_start_time", step=900)
+    st.checkbox("Optimize stop order (shortest transit, right time of day)", key="optimize")
+    go = st.button("🚀 Build my day", type="primary", use_container_width=True, key="gen")
+    if go or ss.pop("auto_generate", False):
+        with st.spinner("Calculating legs and building your agenda..."):
             generate()
     render_results()
 
@@ -1069,14 +1357,12 @@ def section_generate():
 # --------------------------------------------------------------------------
 def main():
     st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown(HERO, unsafe_allow_html=True)
     if not MAPS_KEY:
-        st.title("🧭 RouteGuide")
         st.error("GOOGLE_MAPS_API_KEY is missing. Add it to Streamlit secrets "
                  "(see README.md) and reload.")
         st.stop()
     init_state()
-    st.title("🧭 RouteGuide")
-    st.caption("AI-powered multi-stop itinerary & transit planner")
     if not GEMINI_KEY:
         st.caption("⚠️ GEMINI_API_KEY not set: AI recommendations are unavailable, "
                    "manual search and routing still work.")
